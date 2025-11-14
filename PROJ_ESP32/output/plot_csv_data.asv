@@ -1,0 +1,40 @@
+% plot_csv_data.m
+% Script genérico para plotar qualquer CSV no formato:
+% dt_seconds,value
+% (linhas começando com '#' são ignoradas)
+
+clc; clear; close all;
+
+% === Defina o arquivo CSV aqui ===
+fullpath = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\tes.csv'; % <-- altere conforme o caso
+
+fprintf('Lendo arquivo: %s\n', fullpath);
+
+% === Ler dados ignorando linhas de comentário ===
+try
+    data = readmatrix(fullpath, 'CommentStyle', '#', 'Delimiter', ',');
+catch ME
+    error('Erro lendo o arquivo: %s', ME.message);
+end
+
+if isempty(data) || size(data,2) < 2
+    error('Arquivo inválido ou sem dados suficientes.');
+end
+
+% === Extrair colunas ===
+t = data(:,1);
+v = data(:,2);
+mean = movmean(v)
+% === Plot ===
+figure('Name', fullpath, 'Color', 'w');
+plot(t, v, 'LineWidth', 1.5);
+grid on;
+xlabel('Tempo (s)');
+ylabel('Valor');
+title(sprintf('Dados: %s', fullpath), 'Interpreter', 'none');
+
+% === Estatísticas básicas ===
+fprintf('Total de amostras: %d\n', numel(v));
+fprintf('Valor médio: %.3f\n', mean(v, 'omitnan'));
+fprintf('Mínimo: %.3f\n', min(v));
+fprintf('Máximo: %.3f\n', max(v));
