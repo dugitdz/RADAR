@@ -1,20 +1,4 @@
-﻿DEVICE INFO,,,,,
-UUID,Name,,,,
-8C:1F:64:AF:41:63,OmniBuds-4163,,,,
-,,,,,
-USER INFO,,,,,
-Name,Age,Height,Weight,Gender,
-Eduardo,19,180,68,male,
-,,,,,
-SENSOR CONFIGURATIONS,,,,,
-Selected mode,Both,,,,
-Time,00:01:02,,,,
-Peripheral ID,Peripheral name,Endpoint ID,Endpoint name,Value,Formatted value
-9,Heart Rate,1,Periodicity,1,1Hz
-,,,,,
-RECORDED DATA,,,,,
-Earbud,Peripheral ID,Value 1,Value 2,Value 3,Timestamp
-left,9,83,,,'1762984234781'
+﻿left,9,83,,,'1762984234781'
 right,9,84,,,'1762984244101'
 right,9,80,,,'1762984246123'
 right,9,79,,,'1762984247134'
