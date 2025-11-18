@@ -1,5 +1,5 @@
 // serial_to_csv_sync_defs.c (com print no terminal)
-// Lê a porta serial no Windows e grava CSVs sincronizados,
+// Lê a porta serial no Windows e grava dois CSVs sincronizados,
 // mantendo os dados antigos e mostrando tudo no terminal.
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -46,7 +46,6 @@ static bool set_timeouts(HANDLE h){
     return SetCommTimeouts(h,&t)!=0;
 }
 
-// Extrai valor numérico depois de "Heart Rate:" / "Breath Rate:" / "Distance:"
 static bool extract_value_after_colon(const char* line, const char* keyword, float* out){
     const char* k = strstr(line, keyword);
     if(!k) return false;
@@ -59,44 +58,6 @@ static bool extract_value_after_colon(const char* line, const char* keyword, flo
     if(endp == p) return false;
     *out = (float)v;
     return true;
-}
-
-// Detecta se a linha está no formato:
-// tempo,total_phase,breath_phase,heart_phase,dist
-// e se todos os 5 campos são números válidos.
-static bool is_phase_csv_line(const char* line) {
-    // Ignorar linhas vazias ou comentários
-    const char* p = line;
-    while(*p == ' ' || *p == '\t') ++p;
-    if(*p == '\0' || *p == '#')
-        return false;
-
-    // Contar vírgulas — deve ter exatamente 4
-    int commas = 0;
-    for(const char* q = line; *q; ++q) {
-        if(*q == ',') commas++;
-    }
-    if(commas != 4) return false;
-
-    // Tentar ler 5 números
-    char copy[256];
-    strncpy(copy, line, sizeof(copy)-1);
-    copy[sizeof(copy)-1] = '\0';
-
-    int count = 0;
-    char* ctx = NULL;
-    char* tok = strtok_s(copy, ",", &ctx);
-    while(tok) {
-        // remover espaços nas pontas
-        while(*tok==' ' || *tok=='\t') tok++;
-        char* endp = NULL;
-        strtod(tok, &endp);
-        if(endp == tok) return false; // não converteu nada
-        count++;
-        tok = strtok_s(NULL, ",", &ctx);
-    }
-
-    return (count == 5);
 }
 
 static void make_port_name(const char* in, char* out, size_t outsz){
@@ -139,45 +100,36 @@ int main(void){
         return 3;
     }
 
-    FILE* fHeart    = fopen("heart_rate.csv","a");
-    FILE* fBreath   = fopen("breath_rate.csv","a");
-    FILE* fPhaseRaw = fopen("phases_raw.csv","a");  // novo arquivo
-
-    if(!fHeart || !fBreath || !fPhaseRaw){
+    FILE* fHeart = fopen("heart_rate.csv","a");
+    FILE* fBreath= fopen("breath_rate.csv","a");
+    if(!fHeart || !fBreath){
         fprintf(stderr, "Erro abrindo CSVs para escrita.\n");
-        if(fHeart)    fclose(fHeart);
-        if(fBreath)   fclose(fBreath);
-        if(fPhaseRaw) fclose(fPhaseRaw);
+        if(fHeart) fclose(fHeart);
+        if(fBreath) fclose(fBreath);
         CloseHandle(h);
         return 4;
     }
 
-    // Cabeçalhos se arquivos vazios
+    // Cabeçalho se arquivo vazio
     fseek(fHeart, 0, SEEK_END);
     long szHeart = ftell(fHeart);
     fseek(fBreath, 0, SEEK_END);
     long szBreath = ftell(fBreath);
-    fseek(fPhaseRaw, 0, SEEK_END);
-    long szPhaseRaw = ftell(fPhaseRaw);
 
-    if (szHeart == 0)  fprintf(fHeart,  "dt_seconds,value\n");
-    if (szBreath == 0) fprintf(fBreath, "dt_seconds,value\n");
-    if (szPhaseRaw == 0)
-        fprintf(fPhaseRaw, "tempo,total_phase,breath_phase,heart_phase,dist\n");
+    if (szHeart == 0) fprintf(fHeart, "dt_seconds,value\n");
+    if (szBreath == 0) fprintf(fBreath,"dt_seconds,value\n");
 
     // Marca novo dataset com data/hora
     time_t now_t = time(NULL);
     struct tm* tm_info = localtime(&now_t);
     char timestamp[64];
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
-    fprintf(fHeart,    "# --- NOVO DATASET %s ---\n", timestamp);
-    fprintf(fBreath,   "# --- NOVO DATASET %s ---\n", timestamp);
-    fprintf(fPhaseRaw, "# --- NOVO DATASET %s ---\n", timestamp);
-    fflush(fHeart); fflush(fBreath); fflush(fPhaseRaw);
+    fprintf(fHeart, "# --- NOVO DATASET %s ---\n", timestamp);
+    fprintf(fBreath,"# --- NOVO DATASET %s ---\n", timestamp);
+    fflush(fHeart); fflush(fBreath);
 
-    setvbuf(fHeart,    NULL, _IOLBF, 0);
-    setvbuf(fBreath,   NULL, _IOLBF, 0);
-    setvbuf(fPhaseRaw, NULL, _IOLBF, 0);
+    setvbuf(fHeart, NULL, _IOLBF, 0);
+    setvbuf(fBreath, NULL, _IOLBF, 0);
 
     LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
     LARGE_INTEGER t0;
@@ -188,7 +140,7 @@ int main(void){
 
     printf("Lendo %s @ %d baud...\n", portName, (int)BAUD_RATE);
     printf("t0 = primeira 'Distance:' recebida (fallback: primeira linha válida).\n");
-    printf("Arquivos: heart_rate.csv, breath_rate.csv, phases_raw.csv\n");
+    printf("Arquivos: heart_rate.csv, breath_rate.csv\n");
     printf("===============================================\n");
 
     for(;;){
@@ -205,22 +157,12 @@ int main(void){
             if(c=='\n'){
                 lineBuf[lineLen]='\0';
 
-                // Marca tempo atual do PC
                 LARGE_INTEGER now; QueryPerformanceCounter(&now);
 
-                // === NOVO: se for linha CSV "tempo,total_phase,..." salva crua ===
-                if(is_phase_csv_line(lineBuf)) {
-                    fprintf(fPhaseRaw, "%s\n", lineBuf);
-                    printf("[PHASE] %s\n", lineBuf);
-                }
-
                 float val=0.f;
-
-                // Calibração t0 usando Distance (como antes)
                 if(!have_t0 && extract_value_after_colon(lineBuf, "Distance", &val)){
                     t0 = now; have_t0 = true;
                 }
-                // fallback: primeira linha com Heart/Breath/Distance
                 if(!have_t0){
                     float tmp=0.f;
                     if( extract_value_after_colon(lineBuf,"Heart Rate",&tmp) ||
@@ -252,7 +194,6 @@ int main(void){
                 if(lineLen + 1 < LINE_BUF_SZ) {
                     lineBuf[lineLen++] = c;
                 } else {
-                    // linha muito longa, descarta
                     lineLen = 0;
                 }
             }
@@ -261,7 +202,6 @@ int main(void){
 
     fclose(fHeart);
     fclose(fBreath);
-    fclose(fPhaseRaw);
     CloseHandle(h);
     return 0;
 }
