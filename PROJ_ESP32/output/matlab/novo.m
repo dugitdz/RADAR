@@ -1,10 +1,10 @@
 clc; clear; close all;
 
-radar_HR_path = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\tes.csv';
-radar_RR_path = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\tes_rr.csv';
+radar_HR_path = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\tes.csv';
+radar_RR_path = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\tes_rr.csv';
 
-omni_HR_path = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\omni\Heart3.csv';
-omni_RR_path = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\omni\Breath3.csv';
+omni_HR_path = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\omni\Heart4.csv';
+omni_RR_path = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\omni\Breath4.csv';
 
 [t1,RR_radar] = read_csv_radar(radar_RR_path);
 [t2,HR_radar] = read_csv_radar(radar_HR_path);
