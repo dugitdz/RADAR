@@ -1,0 +1,100 @@
+phases_path = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\phases_raw.csv';
+
+data   = readmatrix(phases_path,'CommentStyle', '#', 'Delimiter', ',');
+tpuro  = data(:,1);
+total  = data(:,2);
+breath = data(:,3);
+heart  = data(:,4);
+
+N = 128;
+i = 1;
+
+t  = (tpuro - tpuro(1)) / 1000;    % tempo em segundos
+nt = length(t);
+
+figure
+plot(t, total, 'black');
+title('TOTAL');
+
+figure
+plot(t, breath, 'b');
+title('BREATH');
+
+figure
+plot(t, heart, 'r');
+title('HEART');
+
+freq_parcial_h  = zeros(size(t));
+freq_parcial_br = zeros(size(t));
+aux_h  = zeros(size(t));
+aux_br = zeros(size(t));
+
+% ================= LOOP DA JANELA DESLIZANTE ==================
+while (i*N/2) <= nt
+    % SUA LÓGICA DE ÍNDICES (mantida)
+    com = 1 + ((i-2)*N/2);
+    if com <= 0
+        com = 1;
+    end
+    fim = i*N/2;
+
+    % não deixa passar do final do vetor
+    if fim > nt
+        fim = nt;
+    end
+
+    temp_novo = t(com:fim);
+    br_novo   = breath(com:fim);
+    h_novo    = heart(com:fim);
+
+    % se a janela ficou muito pequena, sai
+    if numel(temp_novo) < 2
+        break;
+    end
+
+    fs = 1/mean(diff(temp_novo));   % frequência de amostragem aproximada
+
+    % tamanho real da janela
+    L = fim - com + 1;
+    amostra = floor(L/2);           % metade do espectro (parte positiva)
+
+    % HEART
+    f = fft(h_novo);
+    fft_int_h = abs(f(1:amostra));
+    [~, maior] = max(fft_int_h);
+    % frequência correta: (k-1)*fs/L
+    freq_parcial_h(com:fim) = (maior-1)*fs / L;
+
+    % BREATH
+    f = fft(br_novo);
+    fft_int_br = abs(f(1:amostra));
+    [~, maior] = max(fft_int_br);
+    freq_parcial_br(com:fim) = (maior-1)*fs / L;
+
+    % suavização simples com o quadro anterior
+    freq_h  = (freq_parcial_h  + aux_h)  / 2;
+    freq_br = (freq_parcial_br + aux_br) / 2;
+
+    aux_h  = freq_parcial_h;
+    aux_br = freq_parcial_br;
+
+    i = i + 1;
+end
+
+ult = find(freq_h ~= 0, 1, 'last');
+if ~isempty(ult) && ult < nt
+    freq_h(ult+1:end) = freq_h(ult);
+end
+
+ult = find(freq_br ~= 0, 1, 'last');
+if ~isempty(ult) && ult < nt
+    freq_br(ult+1:end) = freq_br(ult);
+end
+freq_br = 60*freq_br;
+freq_h = 60*freq_h;
+mean_h = movmean(freq_h,15);
+mean_br = movmean(freq_br,15);
+figure;
+plot(t,mean_br);
+figure
+plot(t,mean_h)
