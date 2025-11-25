@@ -1,4 +1,4 @@
-phases_path = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\phases_raw.csv';
+phases_path = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\phases_raw.csv';
 
 data   = readmatrix(phases_path,'CommentStyle', '#', 'Delimiter', ',');
 tpuro  = data(:,1);

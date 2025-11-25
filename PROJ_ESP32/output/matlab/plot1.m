@@ -1,13 +1,13 @@
 clc; clear; close all;
 
 %% ========================== PATHS ==========================
-radar_HR_path  = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\tes.csv';
-radar_RR_path  = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\tes_rr.csv';
+radar_HR_path  = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\tes.csv';
+radar_RR_path  = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\tes_rr.csv';
 
-omni_HR_path   = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\omni\Heart4.csv';
-omni_RR_path   = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\omni\Breath4.csv';
+omni_HR_path   = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\omni\Heart4.csv';
+omni_RR_path   = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\omni\Breath4.csv';
 
-polar_HR_path  = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\POLARH10.txt';
+polar_HR_path  = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\POLARH3.txt';
 
 %% ========================== LEITURA DOS DADOS ==========================
 
@@ -23,13 +23,16 @@ polar_HR_path  = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\POLARH10.txt';
 [t5,HR_polar] = read_txt_polar(polar_HR_path);
 
 % Radar_phase vindo do .mat
-load('freq_results.mat');     % carrega t, mean_h, mean_br
-t_phase             = t;       % tempo em segundos
-RR_radar_phase      = mean_br; % já suavizado no outro código
-HR_radar_phase      = mean_h;
+load('freq_results.mat');     % carrega t, mean_h_cont, mean_br_cont
 
-%% ========================== SUAVIZAÇÃO ==========================
+%% ======== SHIFT DOS SINAIS DE PHASE (adiantar 3 s) ========
+shift_sec = 0;
+t_phase   = t - shift_sec;
 
+RR_radar_phase = mean_br_cont;
+HR_radar_phase = mean_h_cont;
+
+%% ========================== SUAVIZAÇÃO =======================
 mean_RR_radar = movmean(RR_radar,15);
 mean_HR_radar = movmean(HR_radar,15);
 
@@ -39,7 +42,7 @@ mean_HR_omni  = movmean(HR_omni,15);
 % Polar SEM movmean — já definido
 % Radar_phase SEM movmean — já definido
 
-% ======== REMOVER TIMESTAMPS DUPLICADOS DO POLAR ==========
+% ======== REMOVER TIMESTAMPS DUPLICADOS DO POLAR ==============
 t_HR_polar = t5;
 [t_HR_polar, ia] = unique(t_HR_polar,'stable');
 HR_polar = HR_polar(ia);
@@ -53,25 +56,21 @@ t0_omni  = min([t3(1),t4(1)]);
 
 % RR: Radar x Omni x Radar_phase
 figure;
-plot((t1 - t0_radar), mean_RR_radar, 'red');
-hold on;
+plot((t1 - t0_radar), mean_RR_radar, 'red'); hold on;
 plot((double(t3 - t0_omni)/1000), mean_RR_omni, 'blue');
 plot(t_phase, RR_radar_phase, 'green');
 legend('Radar','Omni','Radar phase');
-xlabel('Tempo [s]');
-ylabel('RR [rpm]');
+xlabel('Tempo [s]'); ylabel('RR [rpm]');
 title('RR - Radar x Omni x Radar phase');
 
 % HR: Radar x Omni x Polar x Radar_phase
 figure;
-plot((t2 - t0_radar), mean_HR_radar, 'red');
-hold on;
+plot((t2 - t0_radar), mean_HR_radar, 'red'); hold on;
 plot((double(t4 - t0_omni)/1000), mean_HR_omni, 'blue');
 plot(t_HR_polar, HR_polar, 'magenta');
 plot(t_phase, HR_radar_phase, 'green');
 legend('Radar','Omni','Polar','Radar phase');
-xlabel('Tempo [s]');
-ylabel('HR [bpm]');
+xlabel('Tempo [s]'); ylabel('HR [bpm]');
 title('HR - Radar x Omni x Polar x Radar phase');
 
 %% ========================== CÁLCULO DO ERRO ==========================
