@@ -1,7 +1,7 @@
 clc; clear; close all;
 
 %% ========================== PATH ==========================
-phases_path = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\phases_raw.csv';
+phases_path = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\phase.csv';
 
 %% ========================== LEITURA ==========================
 data   = readmatrix(phases_path,'CommentStyle', '#', 'Delimiter', ',');
@@ -9,7 +9,7 @@ tpuro  = data(:,1);      % tempo bruto (ms)
 total  = data(:,2);
 breath = data(:,3);
 heart  = data(:,4);
-
+heart = unwrap(heart);
 %% ========================== NORMALIZAÇÃO DE FASE ==========================
 % limite a fase para [-pi, +pi] sem alterar FFT, só para corrigir wraps muito grandes
 breath = mod(breath + pi, 2*pi) - pi;
@@ -18,11 +18,12 @@ heart  = mod(heart  + pi, 2*pi) - pi;
 % tempo em segundos começando em zero
 t  = (tpuro - tpuro(1)) / 1000;
 nt = numel(t);
+srate = 1/mean(diff(t));
 
 %% ========================== PARÂMETROS FFT ==========================
 N       = 128;
-Nmin    = N/2;
-overlap = 0.9;
+Nmin    = N/4;
+overlap = 0.99;
 hop     = max(1, round(N*(1-overlap)));
 
 gap_thr = 0.5;
@@ -127,15 +128,26 @@ for s = 1:numSeg
         end
         
         % -------- FFT --------
-        Br       = fft(br_win);
-        H        = fft(h_win);
-        nFFT     = numel(br_win);
-        half_fft = floor(nFFT/2);
-        f_axis   = (0:half_fft-1) * fs / nFFT;
+        % %%% VERSÃO ANTIGA (CORTAVA METADE)
+        % Br       = fft(br_win);
+        % H        = fft(h_win);
+        % nFFT     = numel(br_win);
+        % half_fft = floor(nFFT/2);
+        % f_axis   = (0:half_fft-1) * fs / nFFT;
+        % [~,kbr] = max(abs(Br(1:half_fft)));
+        % [~,kh ] = max(abs(H(1:half_fft)));
+        % fbr_hz = f_axis(kbr);
+        % fh_hz  = f_axis(kh);
         
-        [~,kbr] = max(abs(Br(1:half_fft)));
-        [~,kh ] = max(abs(H(1:half_fft)));
-        
+        % %%% ALTERADO AQUI: usa espectro completo, sem cortar "frequência negativa"
+        Br   = fft(br_win);
+        H    = fft(h_win);
+        nFFT = numel(br_win);
+        f_axis = (0:nFFT-1) * fs / nFFT;   % eixo 0..(fs-df)
+
+        [~,kbr] = max(abs(Br));            % pico em todo o espectro
+        [~,kh ] = max(abs(H));
+
         fbr_hz = f_axis(kbr);
         fh_hz  = f_axis(kh);
         
@@ -172,6 +184,30 @@ valid_br = ~isnan(freq_br);
 freq_h_cont  = interp1(t(valid_h),  freq_h(valid_h),  t, 'pchip', 'extrap');
 freq_br_cont = interp1(t(valid_br), freq_br(valid_br), t, 'pchip', 'extrap');
 
+%% ========================== SUAVIZAÇÃO GAUSSIANA (O QUE VOCÊ ESTAVA FAZENDO) ==========================
+h = 2;
+n = length(t);
+t_deslocado = t - t(floor((n+1)/2));
+
+gaus = exp(-4*log(2)*t_deslocado.^2/h^2);
+gaus = gaus/sum(gaus);
+
+ngaus   = length(gaus);
+nsignal = length(freq_h_cont);
+nConv   = ngaus + nsignal - 1;
+half    = floor(ngaus/2);
+
+G = fft(gaus,       nConv);
+S = fft(freq_h_cont,nConv);
+freq_h_new = ifft(G .* S);
+
+freq_h_new = freq_h_new(half+1:end-half);
+
+% ================= AJUSTE PEDIDO =================
+% Se for menor que 60, arredonda para 60 bpm
+freq_h_new(freq_h_new < 60) = 60;
+  % mantém como você colocou
+
 %% ========================== MOVMEAN ==========================
 win_smooth = 256;
 
@@ -181,9 +217,10 @@ mean_br_cont = movmean(freq_br_cont, win_smooth);
 %% ========================== PLOTS ESSENCIAIS ==========================
 figure;
 plot(t, freq_h_cont, '-', 'LineWidth', 1.0); hold on;
+plot(t, freq_h_new, 'm');
 plot(t, mean_h_cont, 'r', 'LineWidth', 1.5);
 xlabel('Tempo (s)'); ylabel('HR (bpm)');
-title('HR contínua + movmean');
+title('HR contínua + gauss + movmean');
 grid on;
 
 figure;
@@ -192,7 +229,7 @@ plot(t, mean_br_cont, 'r', 'LineWidth', 1.5);
 xlabel('Tempo (s)'); ylabel('RR (bpm)');
 title('RR contínua + movmean');
 grid on;
-
+%mean_h_cont = freq_h_new;
 %% ========================== SAVE ==========================
 save('freq_results.mat', 't', ...
     'freq_h', 'freq_br', ...
