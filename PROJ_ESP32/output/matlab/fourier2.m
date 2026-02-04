@@ -13,16 +13,16 @@ clc; clear; close all;
 pairs = struct([]);
 
 pairs(1).name = "H2";
-pairs(1).radar_csv = "C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\phases.csv";
-pairs(1).polar_txt = "C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\POLARH2.txt";
+pairs(1).radar_csv = "C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\phases.csv";
+pairs(1).polar_txt = "C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\POLARH2.txt";
 
 pairs(2).name = "H3";
-pairs(2).radar_csv = "C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\phases_raw.csv";
-pairs(2).polar_txt = "C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\POLARH3.txt";
+pairs(2).radar_csv = "C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\phases_raw.csv";
+pairs(2).polar_txt = "C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\POLARH3.txt";
 
 pairs(3).name = "H10";
-pairs(3).radar_csv = "C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\phase.csv";
-pairs(3).polar_txt = "C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\POLARH10.txt";
+pairs(3).radar_csv = "C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\phase.csv";
+pairs(3).polar_txt = "C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\POLARH10.txt";
 
 %% ========================== FIXOS ==========================
 FS_TARGET   = 25.0;
@@ -44,15 +44,15 @@ LOW_NFFT  = 256;
 RIDGE_LAMBDA_HZ2 = 250;
 
 %% ========================== TOP1 (da tua lista de CORR) ==========================
-FILT_TYPE  = "butter";
+FILT_TYPE  = "cheby2";
 ORD_FINAL  = 4;      % ordem FINAL (par)
-WI         = 1.0;    % Hz (corte do bandpass)
-WF         = 2.5;    % Hz
+WI         = 0.8;    % Hz (corte do bandpass)
+WF         = 2.0;    % Hz
 
-WIN_SPEC   = "blackman";
-N          = 128;
-HOP        = 64;
-NFFT       = 256;
+WIN_SPEC   = "rect";
+N          = 32;
+HOP        = 16;
+NFFT       = 32;
 
 SNR_THR_DB   = 6;
 SNR_RANGE_DB = 9;

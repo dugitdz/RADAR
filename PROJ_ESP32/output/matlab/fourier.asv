@@ -23,53 +23,33 @@ F_MIN_HZ      = 0.05;   % ignora DC/baixíssima freq no pico
 MIN_POINTS_AFTER_RESAMPLE = 32;
 MIN_METRIC_SAMPLES        = 10;
 
-%% ===================== CONFIG (FFT) =====================
-CFG.N    = 128;
-CFG.hop  = 64;
+
+CFG.N    = 32;
+CFG.hop  = 16;
 CFG.WRAP = 0;
 
-CFG.win   = "flattop";   % FIXO
-CFG.ftype = "cheby2";    % FIXO
+% janela e filtro (definitivos)
+CFG.win   = "flattop";   % SOMENTE flattop
+CFG.ftype = "cheby2";    % SOMENTE cheby2
 CFG.ford  = 6;           % ordem final (par) -> cheby2 usa n=ford/2
-CFG.wi    = 0.60;        % Hz
+CFG.wi    = 0.80;        % Hz
 CFG.wf    = 2.00;        % Hz
 
+% harmônicos (definitivos)
 CFG.harm_on    = 1;
 CFG.harm_max   = 3;
 CFG.harm_tol   = 1;
 CFG.harm_ratio = 0.20;
-
-%% ===================== GATING (BP_THEN_GATE) =====================
-GATE_ON     = 1;
-
-HR_MIN_BPM  = 65;
-HR_MAX_BPM  = 210;
-
-DELTA_DB    = -5;     % em potência/PSD (capPow = Ppk_in * 10^(dB/10))
-SMOOTH_BINS = 3;      % suaviza P(k) só pra estimar Ppk_in (0/1 desliga)
-GATE_FLOOR  = 0.0;    % piso absoluto de potência (0 desliga)
-GATE_MODE   = "CAP";  % "CAP" | "ZERO"
-
-% Debug: reconstrução BP+GATE em tempo (overlap-add)
-DEBUG_RECON_ON = true;
-
-% Debug do gate: plota espectro 1 frame (pra ver máscara e teto)
-DEBUG_GATE_PLOT = true;
-DEBUG_GATE_FRAME = 10;   % qual frame (1..Nframes) você quer inspecionar
-DEBUG_GATE_DATASET = "H2"; % em qual dataset você quer inspecionar (H2/H3/H10)
 
 fprintf('\n==================== CONFIG DEFINITIVA ====================\n');
 fprintf('N=%d hop=%d WRAP=%d win=%s | filt=%s ord=%d wi=%.2f wf=%.2f | harm=%d (max=%d tol=%d ratio=%.2f)\n', ...
     CFG.N, CFG.hop, CFG.WRAP, CFG.win, CFG.ftype, CFG.ford, CFG.wi, CFG.wf, ...
     CFG.harm_on, CFG.harm_max, CFG.harm_tol, CFG.harm_ratio);
 
-fprintf('GATE_ON=%d | HR=[%d..%d] bpm | DELTA_DB=%g dB | SMOOTH_BINS=%d | GATE_FLOOR=%g | MODE=%s\n', ...
-    GATE_ON, HR_MIN_BPM, HR_MAX_BPM, DELTA_DB, SMOOTH_BINS, GATE_FLOOR, GATE_MODE);
-
 %% ===================== RUN =====================
 Corrs = []; MAEs = []; RMSEs = []; used = 0;
 
-fprintf('\n==================== RUN (BP_THEN_GATE) ====================\n');
+fprintf('\n==================== RUN (DEFINITIVO) ====================\n');
 
 for d = 1:numel(DATASETS)
     fprintf('\n[DATASET] %s\n', DATASETS(d).name);
@@ -112,28 +92,13 @@ for d = 1:numel(DATASETS)
         continue;
     end
 
-    % ===== FILTRO (BP) =====
-    x_bp = zero_phase_bandpass_cheby2(x_u, FS_TARGET, CFG.wi, CFG.wf, CFG.ford);
+    % ===== FILTRO (cheby2 fixo) =====
+    x_f = zero_phase_bandpass_cheby2(x_u, FS_TARGET, CFG.wi, CFG.wf, CFG.ford);
 
-    % ===== TRACK (BP_THEN_GATE) + RECON x_g =====
-    debug_gate_this = DEBUG_GATE_PLOT && (DATASETS(d).name == DEBUG_GATE_DATASET);
-
-    if DEBUG_RECON_ON
-        [t_frames, f_hz, x_g] = rfft_track_bp_then_gate( ...
-            t_u, x_bp, FS_TARGET, CFG.N, CFG.hop, F_MIN_HZ, ...
-            CFG.harm_on, CFG.harm_max, CFG.harm_tol, CFG.harm_ratio, ...
-            GATE_ON, HR_MIN_BPM, HR_MAX_BPM, DELTA_DB, SMOOTH_BINS, GATE_FLOOR, GATE_MODE, ...
-            true, ...
-            debug_gate_this, DEBUG_GATE_FRAME);
-    else
-        [t_frames, f_hz] = rfft_track_bp_then_gate( ...
-            t_u, x_bp, FS_TARGET, CFG.N, CFG.hop, F_MIN_HZ, ...
-            CFG.harm_on, CFG.harm_max, CFG.harm_tol, CFG.harm_ratio, ...
-            GATE_ON, HR_MIN_BPM, HR_MAX_BPM, DELTA_DB, SMOOTH_BINS, GATE_FLOOR, GATE_MODE, ...
-            false, ...
-            debug_gate_this, DEBUG_GATE_FRAME);
-        x_g = [];
-    end
+    % ===== TRACK rFFT/HOP (flattop fixo) =====
+    [t_frames, f_hz] = rfft_fundamental_track_hop(t_u, x_f, FS_TARGET, ...
+        CFG.N, CFG.hop, F_MIN_HZ, ...
+        CFG.harm_on, CFG.harm_max, CFG.harm_tol, CFG.harm_ratio);
 
     if isempty(t_frames)
         fprintf('  [SKIP] Track vazio.\n');
@@ -141,21 +106,6 @@ for d = 1:numel(DATASETS)
     end
 
     hr_bpm = 60 * f_hz;
-
-    % ===== deixa disponível na workspace =====
-    assignin('base','t_u',t_u);
-    assignin('base','x_u',x_u);     % pré (resample)
-    assignin('base','x_f',x_bp);    % BP
-    if DEBUG_RECON_ON && ~isempty(x_g)
-        assignin('base','x_g',x_g); % BP+GATE (recon)
-    end
-
-    % ===== PLOT SINAIS: pré, bp, bp+gate =====
-    if DEBUG_RECON_ON && ~isempty(x_g)
-        plot_pre_bp_gate(t_u, x_u, x_bp, x_g, DATASETS(d).name);
-    else
-        plot_pre_bp_gate(t_u, x_u, x_bp, [], DATASETS(d).name);
-    end
 
     % ===== GRID COMUM + SUAVIZAÇÃO + MÉTRICAS =====
     t_start  = max(min(t_frames), min(t_polar));
@@ -184,13 +134,14 @@ for d = 1:numel(DATASETS)
 
     fprintf('  OK | corr=%.4f | MAE=%.3f | RMSE=%.3f | n=%d\n', R, MAE, RMSE, n);
 
-    figure('Name', "HR (grid) - "+DATASETS(d).name);
+    % plot por dataset
+    figure('Name', "DEFINITIVO - "+DATASETS(d).name);
     plot(t_common, HR_polar_grid); hold on;
     plot(t_common, HR_radar_grid);
     grid on;
     xlabel('t (s)'); ylabel('HR (bpm)');
     legend('Polar (grid)','Radar (grid)');
-    title(sprintf('%s | corr=%.3f MAE=%.2f RMSE=%.2f', DATASETS(d).name, R, MAE, RMSE));
+    title(sprintf('DEFINITIVO %s | corr=%.3f MAE=%.2f RMSE=%.2f', DATASETS(d).name, R, MAE, RMSE));
 end
 
 fprintf('\n==================== SUMMARY ====================\n');
@@ -202,35 +153,6 @@ else
 end
 
 %% ========================== FUNÇÕES ==========================
-
-function plot_pre_bp_gate(t, x_pre, x_bp, x_gate, tag)
-    t = t(:); x_pre = x_pre(:); x_bp = x_bp(:);
-    has_gate = ~isempty(x_gate);
-
-    figure('Name', "Sinais - "+tag);
-    tiledlayout(3,1,'Padding','compact','TileSpacing','compact');
-
-    nexttile;
-    plot(t, x_pre);
-    grid on; xlabel('t (s)'); ylabel('amp');
-    title(tag + " | PRE (resample)");
-
-    nexttile;
-    plot(t, x_bp);
-    grid on; xlabel('t (s)'); ylabel('amp');
-    title(tag + " | BP");
-
-    nexttile;
-    if has_gate
-        plot(t, x_gate);
-        title(tag + " | BP + GATE (recon overlap-add)");
-    else
-        plot(t, x_bp);
-        title(tag + " | BP + GATE (sem recon) (mostrando BP)");
-    end
-    grid on; xlabel('t (s)'); ylabel('amp');
-end
-
 function x = prep_nowrap(x)
     x = double(x(:));
     ok = isfinite(x);
@@ -292,8 +214,8 @@ function y = zero_phase_bandpass_cheby2(x, fs, wi_hz, wf_hz, order_final)
     if wi_hz <= 0 || wi_hz >= wf_hz, y = x; return; end
     if mod(order_final,2)~=0, y = x; return; end
 
-    n  = order_final/2;
-    Rs = 30;
+    n  = order_final/2;   % cheby2 usa essa ordem
+    Rs = 30;              % stopband dB (fixo)
     [b,a] = cheby2(n, Rs, [wi_hz wf_hz]/(fs/2), 'bandpass');
 
     padlen = 3*(max(length(a), length(b)) - 1);
@@ -304,164 +226,52 @@ function y = zero_phase_bandpass_cheby2(x, fs, wi_hz, wf_hz, order_final)
     y = filtfilt(b,a,x);
 end
 
-function [t_frames, fpk_hz, xg] = rfft_track_bp_then_gate( ...
-    tu, xbp, fs, nperseg, hop, f_min_hz, ...
-    harm_on, harm_max_order, harm_tol_bins, harm_ratio_min, ...
-    gate_on, hr_min_bpm, hr_max_bpm, delta_db, smooth_bins, gate_floor, gate_mode, ...
-    recon_on, ...
-    debug_gate_plot, debug_gate_frame)
+function [t_frames, fpk_hz] = rfft_fundamental_track_hop(tu, xu, fs, nperseg, hop, f_min_hz, ...
+    harm_on, harm_max_order, harm_tol_bins, harm_ratio_min)
 
-    tu = tu(:);
-    xbp = double(xbp(:));
-
-    if numel(xbp) < nperseg || numel(tu) ~= numel(xbp)
-        t_frames = []; fpk_hz = []; xg = []; return;
+    tu = tu(:); xu = xu(:);
+    if numel(xu) < nperseg || numel(tu) ~= numel(xu)
+        t_frames = []; fpk_hz = []; return;
     end
 
-    win  = flattopwin(nperseg,'periodic');
+    win = flattopwin(nperseg,'periodic');  % FIXO
+
     nfft = nperseg;
-    half = floor(nfft/2) + 1;
-
-    k_min = ceil(f_min_hz * nfft / fs) + 1;
+    k_min = ceil(f_min_hz * nfft / fs);
     k_min = max(2, k_min);
-
-    hr_min_hz = hr_min_bpm/60;
-    hr_max_hz = hr_max_bpm/60;
-    k_hr1 = max(k_min, ceil(hr_min_hz * nfft / fs) + 1);
-    k_hr2 = min(half,  floor(hr_max_hz * nfft / fs) + 1);
-    if k_hr2 <= k_hr1
-        t_frames = []; fpk_hz = []; xg = []; return;
-    end
-
-    gate_pow_ratio = 10^(delta_db/10);
-
-    if recon_on
-        xg = zeros(size(xbp));
-        wsum = zeros(size(xbp));
-    else
-        xg = [];
-    end
 
     t_frames = [];
     fpk_hz   = [];
 
     idx0 = 1;
-    L = numel(xbp);
-    frame_count = 0;
-
-    while (idx0 + nperseg - 1) <= L
-        frame_count = frame_count + 1;
-
-        xw = xbp(idx0:idx0+nperseg-1) .* win;
+    while (idx0 + nperseg - 1) <= numel(xu)
+        xw = xu(idx0:idx0+nperseg-1) .* win;
         xw = xw - mean(xw,'omitnan');
 
-        X  = fft(xw, nfft);
-        X1 = X(1:half);
+        X = fft(xw, nfft);
+        half = floor(nfft/2) + 1;
+        P = abs(X(1:half)).^2;
 
-        % P1 só pra estimar pico in-band (e opcionalmente suavizar)
-        P1 = abs(X1).^2;
-        if smooth_bins > 1
-            P1 = movmean(P1, smooth_bins, 'Endpoints','shrink');
+        if k_min > numel(P)
+            idx0 = idx0 + hop; continue;
         end
 
-        % ======= GATE CORRETO: atua em X1 (magnitude), gera X1g coerente =======
-        X1g = X1;
-
-        if gate_on
-            Ppk_in = max(P1(k_hr1:k_hr2));
-
-            if isfinite(Ppk_in) && Ppk_in > 0
-                capPow = Ppk_in * gate_pow_ratio;
-
-                if isfinite(gate_floor) && gate_floor > 0
-                    capPow = max(capPow, gate_floor);
-                end
-
-                capMag = sqrt(capPow);
-
-                Mag1 = abs(X1);
-
-                outband = true(half,1);
-                outband(k_hr1:k_hr2) = false; % NÃO mexe dentro da faixa HR
-                outband(1) = false;           % DC não mexe
-
-                mask_over = outband & (Mag1 > capMag);
-
-                if gate_mode == "ZERO"
-                    X1g(mask_over) = 0;
-                else
-                    % CAP: só escala bins que excederam o teto (preserva fase implicitamente)
-                    X1g(mask_over) = X1(mask_over) .* (capMag ./ Mag1(mask_over));
-                end
-
-                % ===== DEBUG do gate (1 frame): mostra máscara e teto =====
-                if debug_gate_plot && (frame_count == debug_gate_frame)
-                    f = (0:half-1)' * (fs/nfft);
-                    Magg = abs(X1g);
-
-                    figure('Name','DEBUG GATE (1 frame)');
-                    subplot(2,1,1);
-                    plot(f, Mag1); hold on;
-                    plot(f, Magg);
-                    yline(capMag);
-                    xline((k_hr1-1)*fs/nfft); xline((k_hr2-1)*fs/nfft);
-                    grid on; xlabel('Hz'); ylabel('|X|');
-                    legend('|X1|','|X1g|','capMag','HRmin','HRmax');
-                    title(sprintf('Frame %d | capMag=%.4g | k_hr1=%d k_hr2=%d', frame_count, capMag, k_hr1, k_hr2));
-
-                    subplot(2,1,2);
-                    stem(f, double(mask_over), '.'); grid on;
-                    xlabel('Hz'); ylabel('mask\_over');
-                    title('Bins fora da faixa HR que estouraram o teto (mask\_over)');
-                end
-            end
-        end
-
-        % ======= pico no espectro GATED =======
-        Pg = abs(X1g).^2;
-
-        [~, rel] = max(Pg(k_min:end));
+        [~, rel] = max(P(k_min:end));
         k0 = k_min + rel - 1;
 
         if harm_on
-            k0 = harmonic_guard_pick_subharmonic(Pg, k0, k_min, harm_max_order, harm_tol_bins, harm_ratio_min);
+            k0 = harmonic_guard_pick_subharmonic(P, k0, k_min, harm_max_order, harm_tol_bins, harm_ratio_min);
         end
 
-        delta = parabolic_peak_interp_logP(Pg, k0);
+        delta = parabolic_peak_interp_logP(P, k0);
         f_est = (k0 - 1 + delta) * fs / nfft;
 
         t_center = tu(idx0) + 0.5*(nperseg-1)/fs;
         t_frames(end+1,1) = t_center; %#ok<AGROW>
         fpk_hz(end+1,1)   = f_est;    %#ok<AGROW>
 
-        % ======= RECON "BP+GATE" (debug) =======
-        if recon_on
-            Xg_full = build_full_spectrum_from_onesided(X1g, nfft);
-            yg = real(ifft(Xg_full, nfft));
-
-            xg(idx0:idx0+nperseg-1) = xg(idx0:idx0+nperseg-1) + yg .* win;
-            wsum(idx0:idx0+nperseg-1) = wsum(idx0:idx0+nperseg-1) + (win.^2);
-        end
-
         idx0 = idx0 + hop;
     end
-
-    if recon_on
-        m = wsum > 0;
-        xg(m) = xg(m) ./ wsum(m);
-    end
-end
-
-function Xfull = build_full_spectrum_from_onesided(X1, nfft)
-    half = floor(nfft/2)+1;
-    X1 = X1(:);
-    if numel(X1) ~= half
-        error('X1 tamanho inválido.');
-    end
-
-    Xfull = zeros(nfft,1);
-    Xfull(1:half) = X1;
-    Xfull(half+1:end) = conj(X1(half-1:-1:2));
 end
 
 function k_pick = harmonic_guard_pick_subharmonic(P, k0, k_min, max_order, tol_bins, ratio_min)

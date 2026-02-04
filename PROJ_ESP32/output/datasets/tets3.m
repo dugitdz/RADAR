@@ -1,9 +1,9 @@
 clc; clear; close all;
 
 %% ===================== PATHS =====================
-CSV_PATH      = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\phase.csv';
-POLAR_HR_PATH = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\POLARH10.txt';
-TES_PATH      = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\tes.csv';   % formato: t_sec,HR
+CSV_PATH      = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\phase.csv';
+POLAR_HR_PATH = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\POLARH10.txt';
+TES_PATH      = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\tes.csv';   % formato: t_sec,HR
 
 %% ===================== CSV COLUNAS =====================
 COL_T_MS  = 1;
@@ -18,20 +18,20 @@ IMETH     = 'linear';
 
 WRAP_ON   = 0;         % 1: wrap+mean | 0: mean apenas
 
-FLOW = 'GATE_THEN_BP'; % 'BP_THEN_GATE' ou 'GATE_THEN_BP'
+FLOW = 'BP_THEN_GATE'; % 'BP_THEN_GATE' ou 'GATE_THEN_BP'
 
 % GATE
 GATE_ON      = 1;
 HR_MIN_BPM   = 65;
 HR_MAX_BPM   = 210;
-DELTA_DB     = -3;
-SMOOTH_BINS  = 0;
-GATE_FLOOR   = 0.05;
+DELTA_DB     = -5;
+SMOOTH_BINS  = 3;
+GATE_FLOOR   = 0.0;
 
 % BP (BUTTER SOS)
 BP_ON     = 1;
 BP_ORDER  = 2;
-BP_WI     = 0.3;      % Hz
+BP_WI     = 0.3;   % Hz  (SEM CLAMP. usa isto mesmo.)
 BP_WF     = 2.5;       % Hz
 
 % CWT
@@ -43,16 +43,16 @@ CWT_WAVE = 'amor';
 % RIDGE
 BAND_W_HZ      = 0.15;
 DB_FLOOR_BAND  = -25;
-RIDGE_LAMBDA   = 0.05;
-F_JUMP_HZ      = 0.1;
-BURNIN_SEC     = 3;
+RIDGE_LAMBDA   = 0.3;
+F_JUMP_HZ      = 0.15;
+BURNIN_SEC     = 5;
 K_EVENT        = 30;
-PCHAIN_GAMMA   = 0.3;
+PCHAIN_GAMMA   = 0.4;
 PCHAIN_MAX     = 6;
 
 % HARM
 HARM_ON      = 1;
-HARM_REL_DB  = -4;
+HARM_REL_DB  = -6;
 HARM_MIN_BPM = 65;
 HARM_MAX_BPM = 220;
 
@@ -142,13 +142,9 @@ for s = 1:size(segments,1)
             x_flow_spec = gate_by_power_hr_full(x_flow_spec, FS_TARGET, ...
                 HR_MIN_BPM, HR_MAX_BPM, DELTA_DB, SMOOTH_BINS, GATE_FLOOR);
         end
-
-        % BP respeita a banda do gate
         if BP_ON == 1
-            [wi_eff, wf_eff] = clamp_bp_to_gate(BP_WI, BP_WF, HR_MIN_BPM, HR_MAX_BPM);
-            if wi_eff < wf_eff
-                x_flow_spec = apply_bp_sos_unitgain(x_flow_spec, FS_TARGET, BP_ORDER, wi_eff, wf_eff);
-            end
+            % >>> SEM CLAMP. usa BP_WI/BP_WF direto.
+            x_flow_spec = apply_bp_sos_unitgain(x_flow_spec, FS_TARGET, BP_ORDER, BP_WI, BP_WF);
         end
     end
 
@@ -156,7 +152,7 @@ for s = 1:size(segments,1)
     if seg_len > best_len
         best_len = seg_len;
         spec.t    = tnew(:);
-        spec.pure = x_pure_spec(:); % mantido (não vai mais pro plot)
+        spec.pure = x_pure_spec(:);
         spec.gate = x_gate_spec(:);
         spec.flow = x_flow_spec(:);
     end
@@ -181,12 +177,8 @@ for s = 1:size(segments,1)
         else
             x_fin = gate_by_power_hr_full(x_fin, FS_TARGET, ...
                 HR_MIN_BPM, HR_MAX_BPM, DELTA_DB, SMOOTH_BINS, GATE_FLOOR);
-
-            % clamp BP se for GATE_THEN_BP
-            [wi_eff, wf_eff] = clamp_bp_to_gate(BP_WI, BP_WF, HR_MIN_BPM, HR_MAX_BPM);
-            if wi_eff < wf_eff
-                x_fin = apply_bp_sos_unitgain(x_fin, FS_TARGET, BP_ORDER, wi_eff, wf_eff);
-            end
+            % >>> SEM CLAMP
+            x_fin = apply_bp_sos_unitgain(x_fin, FS_TARGET, BP_ORDER, BP_WI, BP_WF);
         end
     end
 
@@ -308,6 +300,9 @@ if ~isempty(spec.t) && numel(spec.gate) >= 16 && numel(spec.flow) >= 16
     plot(ax2, bpm, Pdb_gate, 'LineWidth', 1.2);
     plot(ax2, bpm, Pdb_flow, 'LineWidth', 1.2);
 
+    % DEBUG opcional: mostra onde o FLOW "subiu" vs gate (não depende do 0 dB do topo)
+    % plot(ax2, bpm, (Pdb_flow - Pdb_gate), 'LineWidth', 1.2);
+
     xlim(ax2, [0 300]);
     xlabel(ax2,'BPM (bins FFT)');
     ylabel(ax2,'Potência (dB rel. ao maior pico)');
@@ -319,13 +314,6 @@ else
 end
 
 %% ===================== FUNÇÕES =====================
-
-function [wi_eff, wf_eff] = clamp_bp_to_gate(wi, wf, HR_MIN_BPM, HR_MAX_BPM)
-    wi_gate = HR_MIN_BPM/60;
-    wf_gate = HR_MAX_BPM/60;
-    wi_eff = max(wi, wi_gate);
-    wf_eff = min(wf, wf_gate);
-end
 
 function segments = segment_by_gaps(t, gap_thr)
     t = t(:);
@@ -489,7 +477,7 @@ function [bpm, Pdb_gate, Pdb_flow] = power_bins_overlay2(x_gate, x_flow, Fs, smo
     x_flow = force_finite_vector(x_flow);
 
     N = min([numel(x_gate), numel(x_flow)]);
-    x_gate = x_gate(1:N); 
+    x_gate = x_gate(1:N);
     x_flow = x_flow(1:N);
 
     Xg = fft(x_gate);
@@ -509,7 +497,7 @@ function [bpm, Pdb_gate, Pdb_flow] = power_bins_overlay2(x_gate, x_flow, Fs, smo
     Pg = Pg(1:nh);
     Pf = Pf(1:nh);
 
-    % >>>>>> referência = pico do FLOW (antes de suavizar)
+    % referência = pico do FLOW (antes de suavizar)
     Pref = max(Pf) + eps;
 
     Pdb_gate = 10*log10(Pg/Pref + eps);
@@ -520,14 +508,13 @@ function [bpm, Pdb_gate, Pdb_flow] = power_bins_overlay2(x_gate, x_flow, Fs, smo
         Pdb_flow = movmean(Pdb_flow, smooth_bins, 'omitnan');
     end
 
-    % >>>>>> garante FLOW com topo exatamente em 0 dB (mesmo após smooth)
+    % garante FLOW com topo exatamente em 0 dB (mesmo após smooth)
     peak_flow = max(Pdb_flow);
     if isfinite(peak_flow)
         Pdb_gate = Pdb_gate - peak_flow;
         Pdb_flow = Pdb_flow - peak_flow;
     end
 end
-
 
 % ===== ridge (igual ao seu) =====
 function freq_hz = ridge_area_punish_event_harm(P, f_bin, srate, BAND_W_HZ, DB_FLOOR_BAND, RIDGE_LAMBDA, F_JUMP_HZ, BURNIN_SEC, K_EVENT, GAMMA, KMAX, ...

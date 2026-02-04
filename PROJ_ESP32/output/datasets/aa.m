@@ -1,557 +1,509 @@
-%% ========================================================================
-% GRID POLAR-RADAR (3 PARES) | RAW -> (WRAP) -> SEG -> RESAMPLE -> FLOW -> CWT -> RIDGE
-%
-% Pares:
-%   (1) POLARH2  <-> phases.csv
-%   (2) POLARH3  <-> phases_raw.csv
-%   (3) POLARH10 <-> phase.csv
-%
-% Saídas:
-%   - TOP-5 por métrica (SCORE, RMSE, MAE, CORR) de cada dataset
-%   - TOP-5 geral (por SCORE) de cada dataset
-%   - TOP-5 agregado (média nos 3) por SCORE/RMSE/MAE/CORR
-%
-% Paralelo:
-%   - parfor + DataQueue (status a cada PRINT_EVERY)
-%
-% IMPORTANTÍSSIMO (pedido):
-%   - Se GATE/BP/HARM estiver OFF, as configs desse módulo NÃO variam (não entram no grid).
-%     (ou seja: gate_off => só 1 "dummy config" de gate; idem bp/harm)
-% ========================================================================
-
 clc; clear; close all;
 
-%% ===================== PARES (EDITE AQUI) =====================
-DATASETS = repmat(struct( ...
-    'name', '', ...
-    'CSV_PATH', '', ...
-    'POLAR_PATH', '', ...
-    'COL_T_MS', 1, ...
-    'COL_PHASE', 2), 1, 3);
+%% ===================== PATHS (AJUSTE) =====================
+BASE = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\';
 
-DATASETS(1).name       = 'PolarH2';
-DATASETS(1).CSV_PATH   = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\phases.csv';
-DATASETS(1).POLAR_PATH = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\POLARH2.txt';
+DSETS = struct([]);
 
-DATASETS(2).name       = 'PolarH3';
-DATASETS(2).CSV_PATH   = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\phases_raw.csv';
-DATASETS(2).POLAR_PATH = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\POLARH3.txt';
+DSETS(1).name       = 'POLARH2 <-> phases.csv';
+DSETS(1).csv_path   = fullfile(BASE,'phases.csv');
+DSETS(1).polar_path = fullfile(BASE,'POLARH2.txt');
+DSETS(1).col_t_ms   = 1;  DSETS(1).col_phase = 2;
 
-DATASETS(3).name       = 'PolarH10';
-DATASETS(3).CSV_PATH   = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\phase.csv';
-DATASETS(3).POLAR_PATH = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\POLARH10.txt';
+DSETS(2).name       = 'POLARH3 <-> phases_raw.csv';
+DSETS(2).csv_path   = fullfile(BASE,'phases_raw.csv');
+DSETS(2).polar_path = fullfile(BASE,'POLARH3.txt');
+DSETS(2).col_t_ms   = 1;  DSETS(2).col_phase = 2;
 
-%% ===================== SCORE (AJUSTÁVEL) =====================
-% Ajuste aqui se quiser priorizar outra coisa.
-W_RMSE  = 1.00;
-W_MAE   = 0.35;
-W_1CORR = 5.00;   % penaliza (1 - corr_clamp)
+DSETS(3).name       = 'POLARH10 <-> phase.csv';
+DSETS(3).csv_path   = fullfile(BASE,'phase.csv');
+DSETS(3).polar_path = fullfile(BASE,'POLARH10.txt');
+DSETS(3).col_t_ms   = 1;  DSETS(3).col_phase = 2;
 
-%% ===================== PARALELO / STATUS =====================
-USE_PARFOR  = true;
-PRINT_EVERY = 200;       % status a cada N configs (no parfor, via DataQueue)
-TOPK        = 5;
+%% ===================== GRID (COARSE, REAL) =====================
+% ---- segmentação / resample ----
+GRID.gap_thr     = [0.5];      % s
+GRID.MIN_SEG_SEC = [2.0];      % s
+GRID.FS_TARGET   = [25];            % Hz
+GRID.IMETH       = {'linear'}; % interp
+GRID.WRAP_ON     = [0 1];              % wrap+mean vs mean
 
-%% ===================== GRID (COARSE - edite) =====================
-GRID.gap_thr     = [0.5];
-GRID.MIN_SEG_SEC = [2.0];
+% ---- ordem do fluxo ----
+GRID.FLOW = {'BP_THEN_GATE','GATE_THEN_BP'};
 
-GRID.FS_TARGET = [25.0];
-GRID.IMETH     = {'linear'};                 % 'linear' | 'pchip'
+% ---- features ON/OFF ----
+GRID.BP_ON   = [1];
+GRID.GATE_ON = [1];
+GRID.HARM_ON = [0 1];
 
-GRID.WRAP_ON   = [0];                      % 0=unwrap-mean | 1=wrap
-GRID.FLOW      = {'GATE_THEN_BP', 'BP_THEN_GATE'};
+% ---- BP params (só usados se BP_ON=1) ----
+GRID.BP_ORDER = [2 6];
+GRID.BP_WI    = [0.1 0.4 0.7];  % Hz (sem clamp)
+GRID.BP_WF    = [2.5];     % Hz
 
-% GATE
-GRID.GATE_ON     = [1];                      % pode [0 1]
-GRID.HR_MIN_BPM  = [55];
+% ---- GATE params (só usados se GATE_ON=1) ----
+GRID.HR_MIN_BPM  = [65];
 GRID.HR_MAX_BPM  = [210];
-GRID.DELTA_DB    = [-3 0 3];
-GRID.SMOOTH_BINS = [1 3 7];
-GRID.GATE_FLOOR  = [0.0 0.1];
+GRID.DELTA_DB    = [-3 -5];
+GRID.SMOOTH_BINS = [0 3 7];          % 0 = off
+GRID.GATE_FLOOR  = [0 0.1];
 
-% BP
-GRID.BP_ON    = [1];                         % pode [0 1]
-GRID.BP_ORDER = [4 8];
-GRID.BP_WI    = [0.7 1];
-GRID.BP_WF    = [2.7];
-
-% CWT
-GRID.WI       = [0.5];
+% ---- CWT (mantém quase fixo pra não explodir) ----
+GRID.WI       = [0.6];
 GRID.WF       = [3.0];
 GRID.VOICES   = [16];
 GRID.CWT_WAVE = {'amor'};
 
-% RIDGE (area + punish + event)
-GRID.BAND_W_HZ      = [0.1 0.2 0.3];
-GRID.DB_FLOOR_BAND  = [-25];
-GRID.RIDGE_LAMBDA   = [0 0.05 0.15 0.25];
-GRID.F_JUMP_HZ      = [0.10];
-GRID.BURNIN_SEC     = [0];
-GRID.K_EVENT        = [30];
-GRID.PCHAIN_GAMMA   = [0.8];
-GRID.PCHAIN_MAX     = [12];
+% ---- RIDGE (varre o que costuma mandar muito) ----
+GRID.BAND_W_HZ     = [0.15 0.30];
+GRID.DB_FLOOR_BAND = [-25];
+GRID.RIDGE_LAMBDA  = [0.05 0.15 0.3];
+GRID.F_JUMP_HZ     = [0.15 0.4];
+GRID.BURNIN_SEC    = [5];
+GRID.K_EVENT       = [30];
+GRID.PCHAIN_GAMMA  = [0.4 0.8];
+GRID.PCHAIN_MAX    = [6];
 
-% HARM
-GRID.HARM_ON      = [0 1];                     % pode [0 1]
-GRID.HARM_REL_DB  = [-6 -2];
-GRID.HARM_MIN_BPM = [40];
+% ---- HARM params (só usados se HARM_ON=1) ----
+GRID.HARM_REL_DB  = [-2 -6];
+GRID.HARM_MIN_BPM = [65];
 GRID.HARM_MAX_BPM = [220];
 
-% smooth final (dentro do segmento)
+% ---- suavização final ----
 GRID.MOVMEAN_SEC = [7];
 
-%% ===================== MATERIALIZA GRID (com lógica OFF => não varia) =====================
-CFG = materialize_grid_conditional(GRID);
-nCfg = numel(CFG);
-nDS  = numel(DATASETS);
+%% ===================== BUILD CONFIGS (SEM CONFIGS OCIOSAS) =====================
+CFG = build_cfg_list(GRID);
+NCFG = numel(CFG);
 
-fprintf('Grid configs (condicional OFF): %d | Datasets: %d\n', nCfg, nDS);
+fprintf('Datasets=%d | Configs=%d | Total jobs=%d\n', numel(DSETS), NCFG, numel(DSETS)*NCFG);
 
-%% ===================== PRÉ-CACHE DATASETS (carrega 1x) =====================
-CACHE = repmat(struct( ...
-    'name','', ...
-    't0',[], ...
-    'x_wrap',[], ...
-    'x_unwrap',[], ...
-    't_polar',[], ...
-    'h_polar',[]), 1, nDS);
-
-for d = 1:nDS
-    ds = DATASETS(d);
-    CACHE(d).name = ds.name;
-
-    % --- radar csv ---
-    [t0, ph0] = read_radar_csv(ds.CSV_PATH, ds.COL_T_MS, ds.COL_PHASE);
-
-    t0  = (t0 - t0(1)); % segundos
-    [t0, ia] = unique(t0,'stable');
-    ph0 = ph0(ia);
-
-    ph0 = force_finite_vector(double(ph0));
-    phU = unwrap(ph0);
-
-    CACHE(d).t0       = t0(:);
-    CACHE(d).x_wrap   = wrap_phase(phU);
-    x_unw             = phU - mean(phU,'omitnan');
-    CACHE(d).x_unwrap = force_finite_vector(x_unw);
-
-    % --- polar ---
-    [tP, hP] = read_txt_polar_flex(ds.POLAR_PATH);
-    CACHE(d).t_polar = tP(:);
-    CACHE(d).h_polar = hP(:);
+%% ===================== PARALLEL =====================
+p = gcp('nocreate');
+if isempty(p)
+    parpool('Processes',6); % ou 'Threads'
 end
 
-%% ===================== RESULT ARRAYS =====================
-RMSE  = nan(nCfg, nDS);
-MAE   = nan(nCfg, nDS);
-CORR  = nan(nCfg, nDS);
-SCORE = nan(nCfg, nDS);
-NVAL  = zeros(nCfg, nDS);
+dq = parallel.pool.DataQueue;
+afterEach(dq, @progress_cb);
+progress_cb('init', numel(DSETS)*NCFG);
 
-%% ===================== LOOP GRID (parfor) =====================
-tStart = tic;
+%% ===================== LOOP DATASETS =====================
+ALL = cell(numel(DSETS),1);
 
-if USE_PARFOR && license('test','Distrib_Computing_Toolbox')
-    dq = parallel.pool.DataQueue;
-    progress = 0;
-    afterEach(dq, @(msg) local_progress_print(msg));
+for d = 1:numel(DSETS)
+    ds = DSETS(d);
+    fprintf('\n==================== %s ====================\n', ds.name);
 
-    parfor c = 1:nCfg
-        [RMSE(c,:), MAE(c,:), CORR(c,:), SCORE(c,:), NVAL(c,:)] = ...
-            eval_one_cfg(CFG(c), CACHE, W_RMSE, W_MAE, W_1CORR);
+    % --- lê radar 1x por dataset ---
+    A = readmatrix(ds.csv_path);
+    tpuro_ms = A(:, ds.col_t_ms);
+    phase0   = A(:, ds.col_phase);
 
-        if mod(c, PRINT_EVERY) == 0 || c == 1
-            send(dq, struct('c',c,'nCfg',nCfg,'cfg_id',CFG(c).cfg_id,'elapsed',toc(tStart)));
+    tpuro_ms = tpuro_ms(:);
+    phase0   = phase0(:);
+
+    t0 = (tpuro_ms - tpuro_ms(1))/1000;
+    [t0, ia] = unique(t0, 'stable');
+    phase0   = phase0(ia);
+
+    ph = force_finite_vector(double(phase0));
+    ph = unwrap(ph);
+
+    % --- lê polar 1x por dataset ---
+    [tG, hP] = read_txt_polar_flex(ds.polar_path);
+    tG = tG(:); hP = hP(:);
+
+    R = repmat(struct( ...
+        'ds', ds.name, 'cfg_id',0, ...
+        'RMSE',NaN,'MAE',NaN,'CORR',NaN,'Nval',0, ...
+        'bp',0,'gate',0,'harm',0, ...
+        'gap_thr',NaN,'minseg',NaN,'fs',NaN,'wrap',NaN,'imeth',"", 'flow',"", ...
+        'bp_ord',NaN,'bp_wi',NaN,'bp_wf',NaN, ...
+        'hrmin',NaN,'hrmax',NaN,'delta_db',NaN,'smooth_bins',NaN,'gate_floor',NaN, ...
+        'voices',NaN,'bandw',NaN,'dbfloor',NaN,'lam',NaN,'fjump',NaN,'burn',NaN,'kevent',NaN,'pgamma',NaN,'pmax',NaN, ...
+        'hrel',NaN,'hmin',NaN,'hmax',NaN, ...
+        'mov',NaN), NCFG, 1);
+
+    parfor c = 1:NCFG
+        C = CFG(c);
+
+        % prepara x0 conforme WRAP_ON
+        if C.WRAP_ON == 1
+            x0 = wrap_phase(ph);
+        else
+            x0 = ph - mean(ph,'omitnan');
+            x0 = force_finite_vector(x0);
         end
-    end
-else
-    for c = 1:nCfg
-        if mod(c, PRINT_EVERY) == 0 || c == 1
-            fprintf('[%5d/%5d] cfg_id=%d | elapsed=%.1fs\n', c, nCfg, CFG(c).cfg_id, toc(tStart));
+
+        segments = segment_by_gaps(t0, C.gap_thr);
+
+        [t_all, h_all] = run_one_cfg( ...
+            t0, x0, segments, ...
+            C.FS_TARGET, char(C.IMETH), C.MIN_SEG_SEC, ...
+            char(C.FLOW), ...
+            C.BP_ON, C.BP_ORDER, C.BP_WI, C.BP_WF, ...
+            C.GATE_ON, C.HR_MIN_BPM, C.HR_MAX_BPM, C.DELTA_DB, C.SMOOTH_BINS, C.GATE_FLOOR, ...
+            C.WI, C.WF, C.VOICES, char(C.CWT_WAVE), ...
+            C.BAND_W_HZ, C.DB_FLOOR_BAND, C.RIDGE_LAMBDA, C.F_JUMP_HZ, C.BURNIN_SEC, ...
+            C.K_EVENT, C.PCHAIN_GAMMA, C.PCHAIN_MAX, ...
+            C.HARM_ON, C.HARM_REL_DB, C.HARM_MIN_BPM, C.HARM_MAX_BPM, ...
+            C.MOVMEAN_SEC);
+
+        hC_onP = interp1(t_all, h_all, tG, 'linear', NaN);
+        mE = isfinite(hC_onP) & isfinite(hP);
+        Nval = nnz(mE);
+
+        if Nval >= 5
+            e = hC_onP(mE) - hP(mE);
+            RMSE = sqrt(mean(e.^2,'omitnan'));
+            MAE  = mean(abs(e),'omitnan');
+            CORR = corr(hC_onP(mE), hP(mE), 'Rows','complete');
+        else
+            RMSE = NaN; MAE = NaN; CORR = NaN;
         end
-        [RMSE(c,:), MAE(c,:), CORR(c,:), SCORE(c,:), NVAL(c,:)] = ...
-            eval_one_cfg(CFG(c), CACHE, W_RMSE, W_MAE, W_1CORR);
+
+tmp = R(c);  % <<< usa template pré-alocado (mesmos campos sempre)
+
+tmp.ds     = ds.name;
+tmp.cfg_id = c;
+
+tmp.RMSE = RMSE;
+tmp.MAE  = MAE;
+tmp.CORR = CORR;
+tmp.Nval = Nval;
+
+% flags
+tmp.bp   = C.BP_ON;
+tmp.gate = C.GATE_ON;
+tmp.harm = C.HARM_ON;
+
+% cfg dump (tudo numérico/char; evita "string" no parfor)
+tmp.gap_thr = C.gap_thr;
+tmp.minseg  = C.MIN_SEG_SEC;
+tmp.fs      = C.FS_TARGET;
+tmp.wrap    = C.WRAP_ON;
+tmp.imeth   = char(C.IMETH);   % <<< char
+tmp.flow    = char(C.FLOW);    % <<< char
+
+tmp.bp_ord = C.BP_ORDER;
+tmp.bp_wi  = C.BP_WI;
+tmp.bp_wf  = C.BP_WF;
+
+tmp.hrmin      = C.HR_MIN_BPM;
+tmp.hrmax      = C.HR_MAX_BPM;
+tmp.delta_db   = C.DELTA_DB;
+tmp.smooth_bins= C.SMOOTH_BINS;
+tmp.gate_floor = C.GATE_FLOOR;
+
+tmp.voices = C.VOICES;
+
+tmp.bandw  = C.BAND_W_HZ;
+tmp.dbfloor= C.DB_FLOOR_BAND;
+tmp.lam    = C.RIDGE_LAMBDA;
+tmp.fjump  = C.F_JUMP_HZ;
+tmp.burn   = C.BURNIN_SEC;
+tmp.kevent = C.K_EVENT;
+tmp.pgamma = C.PCHAIN_GAMMA;
+tmp.pmax   = C.PCHAIN_MAX;
+
+tmp.hrel = C.HARM_REL_DB;
+tmp.hmin = C.HARM_MIN_BPM;
+tmp.hmax = C.HARM_MAX_BPM;
+
+tmp.mov = C.MOVMEAN_SEC;
+
+R(c) = tmp;  % <<< agora sim: struct "fatiável" pro parfor
+
+        send(dq, 1);
+    end
+
+    ALL{d} = R;
+
+    T = struct2table(R);
+    T = T(isfinite(T.MAE),:);
+    T_mae  = sortrows(T, {'MAE','RMSE'}, {'ascend','ascend'});
+    T_corr = sortrows(T, {'CORR','MAE'}, {'descend','ascend'});
+
+    fprintf('TOP-5 por MAE:\n');
+    disp(T_mae(1:min(5,height(T_mae)), {'cfg_id','bp','gate','harm','MAE','RMSE','CORR','Nval','gap_thr','minseg','fs','wrap','imeth','flow','bp_ord','bp_wi','bp_wf','delta_db','gate_floor','lam','fjump','bandw','kevent','mov'}));
+
+    fprintf('TOP-5 por CORR:\n');
+    disp(T_corr(1:min(5,height(T_corr)), {'cfg_id','bp','gate','harm','MAE','RMSE','CORR','Nval','gap_thr','minseg','fs','wrap','imeth','flow','bp_ord','bp_wi','bp_wf','delta_db','gate_floor','lam','fjump','bandw','kevent','mov'}));
+end
+
+%% ===================== AGREGADO ENTRE DATASETS =====================
+AG = [];
+for d = 1:numel(ALL)
+    AG = [AG; struct2table(ALL{d})]; %#ok<AGROW>
+end
+
+% agrupa por chaves principais do cfg
+keys = {'bp','gate','harm','gap_thr','minseg','fs','wrap','imeth','flow', ...
+        'bp_ord','bp_wi','bp_wf','hrmin','hrmax','delta_db','smooth_bins','gate_floor', ...
+        'voices','bandw','dbfloor','lam','fjump','burn','kevent','pgamma','pmax', ...
+        'hrel','hmin','hmax','mov'};
+
+G = groupsummary(AG, keys, 'mean', {'MAE','RMSE','CORR','Nval'});
+G = sortrows(G, {'mean_MAE','mean_RMSE'}, {'ascend','ascend'});
+
+fprintf('\n==================== AGREGADO (média) | TOP-15 por MAE ====================\n');
+disp(G(1:min(15,height(G)), [keys, {'mean_MAE','mean_RMSE','mean_CORR','mean_Nval'}]));
+
+%% ===================== CALLBACK PROGRESS =====================
+function progress_cb(x, total)
+    persistent cnt T0 TOT
+    if ischar(x) && strcmpi(x,'init')
+        cnt = 0; T0 = tic; TOT = total; return;
+    end
+    cnt = cnt + 1;
+    if mod(cnt, 200) == 0 || cnt == TOT
+        fprintf('[%d/%d] elapsed=%.1fs\n', cnt, TOT, toc(T0));
     end
 end
 
-fprintf('DONE. elapsed=%.1fs\n', toc(tStart));
-
-%% ===================== AGREGADO (média nos 3 datasets) =====================
-RMSEg  = mean(RMSE,  2, 'omitnan');
-MAEg   = mean(MAE,   2, 'omitnan');
-CORRg  = mean(CORR,  2, 'omitnan');
-SCOREg = mean(SCORE, 2, 'omitnan');
-TOPK = 50;  % use 20/50/100 pra ficar estável
-
-deltas = arrayfun(@(c) c.DELTA_DB, CFG).';  % coluna com DELTA_DB por cfg
-
-% ----------- agregado -----------
-report_dom('AGG SCOREg', deltas, SCOREg, 'ascend', TOPK);
-report_dom('AGG RMSEg',  deltas, RMSEg,  'ascend', TOPK);
-report_dom('AGG MAEg',   deltas, MAEg,   'ascend', TOPK);
-report_dom('AGG CORRg',  deltas, CORRg,  'descend', TOPK);
-
-% ----------- por dataset -----------
-for d=1:size(SCORE,2)
-    report_dom(sprintf('%s SCORE',  CACHE(d).name), deltas, SCORE(:,d), 'ascend', TOPK);
-    report_dom(sprintf('%s RMSE',   CACHE(d).name), deltas, RMSE(:,d),  'ascend', TOPK);
-    report_dom(sprintf('%s MAE',    CACHE(d).name), deltas, MAE(:,d),   'ascend', TOPK);
-    report_dom(sprintf('%s CORR',   CACHE(d).name), deltas, CORR(:,d),  'descend', TOPK);
-end
-
-function report_dom(tag, deltas, metric, mode, TOPK)
-    if strcmpi(mode,'ascend')
-        [~, ix] = sort(metric, 'ascend', 'MissingPlacement','last');
-    else
-        [~, ix] = sort(metric, 'descend', 'MissingPlacement','last');
-    end
-    ix = ix(1:min(TOPK, numel(ix)));
-    v  = deltas(ix);
-    v  = v(isfinite(v));  % só configs com gate_on=1 (as outras viram NaN)
-
-    if isempty(v)
-        fprintf('%s: sem dados (gate_off?)\n', tag);
-        return;
-    end
-
-    [u,~,g] = unique(v);
-    cnt = accumarray(g,1);
-    [cnt, ord] = sort(cnt,'descend');
-    u = u(ord);
-
-    fprintf('%s | TOP-%d: ', tag, TOPK);
-    for i=1:numel(u)
-        fprintf('DELTA=%g (%d)  ', u(i), cnt(i));
-    end
-    fprintf('\n');
-end
-
-
-%% ===================== TOP-5 AGREGADO =====================
-fprintf('\n================== TOP-%d AGREGADO por SCOREg (menor melhor) ==================\n', TOPK);
-ix = sort_idx(SCOREg,'ascend');
-print_top_aggr(CFG, ix(1:TOPK), SCOREg, RMSEg, MAEg, CORRg);
-
-fprintf('\n================== TOP-%d AGREGADO por RMSEg (menor melhor) ==================\n', TOPK);
-ix = sort_idx(RMSEg,'ascend');
-print_top_aggr(CFG, ix(1:TOPK), SCOREg, RMSEg, MAEg, CORRg);
-
-fprintf('\n================== TOP-%d AGREGADO por MAEg (menor melhor) ==================\n', TOPK);
-ix = sort_idx(MAEg,'ascend');
-print_top_aggr(CFG, ix(1:TOPK), SCOREg, RMSEg, MAEg, CORRg);
-
-fprintf('\n================== TOP-%d AGREGADO por CORRg (maior melhor) ==================\n', TOPK);
-ix = sort_idx(CORRg,'descend');
-print_top_aggr(CFG, ix(1:TOPK), SCOREg, RMSEg, MAEg, CORRg);
-
-%% ===================== TOP-5 POR DATASET =====================
-for d = 1:nDS
-    nm = CACHE(d).name;
-
-    fprintf('\n================== %s | TOP-%d GERAL (por SCORE) ==================\n', nm, TOPK);
-    ix = sort_idx(SCORE(:,d),'ascend');
-    print_top_1ds(CFG, ix(1:TOPK), SCORE(:,d), RMSE(:,d), MAE(:,d), CORR(:,d), NVAL(:,d));
-
-    fprintf('\n================== %s | TOP-%d por RMSE ==================\n', nm, TOPK);
-    ix = sort_idx(RMSE(:,d),'ascend');
-    print_top_1ds(CFG, ix(1:TOPK), SCORE(:,d), RMSE(:,d), MAE(:,d), CORR(:,d), NVAL(:,d));
-
-    fprintf('\n================== %s | TOP-%d por MAE ==================\n', nm, TOPK);
-    ix = sort_idx(MAE(:,d),'ascend');
-    print_top_1ds(CFG, ix(1:TOPK), SCORE(:,d), RMSE(:,d), MAE(:,d), CORR(:,d), NVAL(:,d));
-
-    fprintf('\n================== %s | TOP-%d por CORR ==================\n', nm, TOPK);
-    ix = sort_idx(CORR(:,d),'descend');
-    print_top_1ds(CFG, ix(1:TOPK), SCORE(:,d), RMSE(:,d), MAE(:,d), CORR(:,d), NVAL(:,d));
-end
-
-%% ===================== (OPCIONAL) PLOT do melhor cfg agregado =====================
-best = find(SCOREg == min(SCOREg,[],'omitnan'), 1, 'first');
-if ~isempty(best)
-    fprintf('\nPlot do melhor AGREGADO: cfg_id=%d\n', CFG(best).cfg_id);
-    plot_best_cfg(CFG(best), CACHE);
-end
-
-%% ========================================================================
-%                               FUNÇÕES
-% ========================================================================
-
-function local_progress_print(msg)
-    fprintf('[%5d/%5d] cfg_id=%d | elapsed=%.1fs\n', msg.c, msg.nCfg, msg.cfg_id, msg.elapsed);
-end
-
-function ix = sort_idx(v, mode)
-    if strcmpi(mode,'ascend')
-        [~, ix] = sort(v, 'ascend', 'MissingPlacement','last');
-    else
-        [~, ix] = sort(v, 'descend', 'MissingPlacement','last');
-    end
-end
-
-function CFG = materialize_grid_conditional(G)
-    % Grid condicional:
-    % - escolhe GATE_ON; se 0 => gate params viram 1 combo só (dummy)
-    % - escolhe BP_ON;   se 0 => bp params viram 1 combo só (dummy)
-    % - escolhe HARM_ON; se 0 => harm params viram 1 combo só (dummy)
-
-    cfgs = [];
+%% ===================== BUILD CFG LIST (SEM OCIOSAS) =====================
+function CFG = build_cfg_list(GRID)
+    CFG = struct([]);
     id = 0;
 
-    for gap_thr = G.gap_thr
-    for minseg  = G.MIN_SEG_SEC
-    for fs      = G.FS_TARGET
-    for im_i    = 1:numel(G.IMETH)
-        IMETH = G.IMETH{im_i};
-    for wrap_on = G.WRAP_ON
-    for flow_i  = 1:numel(G.FLOW)
-        FLOW = G.FLOW{flow_i};
+    for gap_thr = GRID.gap_thr
+    for MIN_SEG_SEC = GRID.MIN_SEG_SEC
+    for FS_TARGET = GRID.FS_TARGET
+    for im = 1:numel(GRID.IMETH); IMETH = GRID.IMETH{im};
+    for WRAP_ON = GRID.WRAP_ON
+    for fl = 1:numel(GRID.FLOW); FLOW = GRID.FLOW{fl};
 
-        for gate_on = G.GATE_ON
-            if gate_on == 1
-                HR_MIN_BPM_list  = G.HR_MIN_BPM;
-                HR_MAX_BPM_list  = G.HR_MAX_BPM;
-                DELTA_DB_list    = G.DELTA_DB;
-                SMOOTH_BINS_list = G.SMOOTH_BINS;
-                GATE_FLOOR_list  = G.GATE_FLOOR;
+        for BP_ON = GRID.BP_ON
+        for GATE_ON = GRID.GATE_ON
+        for HARM_ON = GRID.HARM_ON
+
+            % --- parâmetros que dependem de feature ON ---
+            if BP_ON == 1
+                BP_ORDER_list = GRID.BP_ORDER;
+                BP_WI_list    = GRID.BP_WI;
+                BP_WF_list    = GRID.BP_WF;
             else
-                HR_MIN_BPM_list  = NaN;
-                HR_MAX_BPM_list  = NaN;
-                DELTA_DB_list    = NaN;
-                SMOOTH_BINS_list = NaN;
-                GATE_FLOOR_list  = NaN;
+                BP_ORDER_list = 2;  % dummy fixo
+                BP_WI_list    = 0.1;
+                BP_WF_list    = 3.0;
             end
 
-            for bp_on = G.BP_ON
-                if bp_on == 1
-                    BP_ORDER_list = G.BP_ORDER;
-                    BP_WI_list    = G.BP_WI;
-                    BP_WF_list    = G.BP_WF;
-                else
-                    BP_ORDER_list = NaN;
-                    BP_WI_list    = NaN;
-                    BP_WF_list    = NaN;
+            if GATE_ON == 1
+                HR_MIN_list   = GRID.HR_MIN_BPM;
+                HR_MAX_list   = GRID.HR_MAX_BPM;
+                DELTA_list    = GRID.DELTA_DB;
+                SMOOTH_list   = GRID.SMOOTH_BINS;
+                FLOOR_list    = GRID.GATE_FLOOR;
+            else
+                HR_MIN_list = 65; HR_MAX_list = 210; DELTA_list = -5; SMOOTH_list = 0; FLOOR_list = 0.05;
+            end
+
+            if HARM_ON == 1
+                HREL_list  = GRID.HARM_REL_DB;
+                HMIN_list  = GRID.HARM_MIN_BPM;
+                HMAX_list  = GRID.HARM_MAX_BPM;
+            else
+                HREL_list = -4; HMIN_list = 65; HMAX_list = 220;
+            end
+
+            for BP_ORDER = BP_ORDER_list
+            for BP_WI = BP_WI_list
+            for BP_WF = BP_WF_list
+                if BP_ON==1 && ~(BP_WI > 0 && BP_WI < BP_WF && BP_WF < FS_TARGET/2)
+                    continue;
                 end
 
-                for harm_on = G.HARM_ON
-                    if harm_on == 1
-                        HARM_REL_DB_list  = G.HARM_REL_DB;
-                        HARM_MIN_BPM_list = G.HARM_MIN_BPM;
-                        HARM_MAX_BPM_list = G.HARM_MAX_BPM;
-                    else
-                        HARM_REL_DB_list  = NaN;
-                        HARM_MIN_BPM_list = NaN;
-                        HARM_MAX_BPM_list = NaN;
+                for HR_MIN_BPM = HR_MIN_list
+                for HR_MAX_BPM = HR_MAX_list
+                    if GATE_ON==1 && ~(HR_MIN_BPM < HR_MAX_BPM)
+                        continue;
                     end
 
-                    for HR_MIN_BPM = HR_MIN_BPM_list
-                    for HR_MAX_BPM = HR_MAX_BPM_list
-                    for DELTA_DB   = DELTA_DB_list
-                    for SMOOTH_BINS= SMOOTH_BINS_list
-                    for GATE_FLOOR = GATE_FLOOR_list
+                    for DELTA_DB = DELTA_list
+                    for SMOOTH_BINS = SMOOTH_list
+                    for GATE_FLOOR  = FLOOR_list
 
-                    for BP_ORDER = BP_ORDER_list
-                    for BP_WI    = BP_WI_list
-                    for BP_WF    = BP_WF_list
-
-                    for WI = G.WI
-                    for WF = G.WF
-                    for VOICES = G.VOICES
-                    for cw_i = 1:numel(G.CWT_WAVE)
-                        CWT_WAVE = G.CWT_WAVE{cw_i};
-
-                        for BAND_W_HZ = G.BAND_W_HZ
-                        for DB_FLOOR_BAND = G.DB_FLOOR_BAND
-                        for RIDGE_LAMBDA = G.RIDGE_LAMBDA
-                        for F_JUMP_HZ = G.F_JUMP_HZ
-                        for BURNIN_SEC = G.BURNIN_SEC
-                        for K_EVENT = G.K_EVENT
-                        for GAMMA = G.PCHAIN_GAMMA
-                        for KMAX = G.PCHAIN_MAX
-                        for HARM_REL_DB = HARM_REL_DB_list
-                        for HARM_MIN_BPM = HARM_MIN_BPM_list
-                        for HARM_MAX_BPM = HARM_MAX_BPM_list
-                        for MOVMEAN_SEC = G.MOVMEAN_SEC
-
-                            % sanity (evita configs inválidas quando BP_ON=1)
-                            if bp_on==1
-                                if ~(isfinite(BP_WI) && isfinite(BP_WF) && BP_WI>0 && BP_WF>BP_WI && BP_WF < fs/2)
-                                    continue;
-                                end
-                            end
-                            if ~(WI>0 && WF>WI && WF < fs/2)
+                        for WI = GRID.WI
+                        for WF = GRID.WF
+                            if ~(WI > 0 && WI < WF && WF < FS_TARGET/2)
                                 continue;
                             end
 
-                            id = id + 1;
-                            c = struct();
-                            c.cfg_id = id;
+                            for VOICES = GRID.VOICES
+                            for cw = 1:numel(GRID.CWT_WAVE); CWT_WAVE = GRID.CWT_WAVE{cw};
 
-                            c.gap_thr     = gap_thr;
-                            c.MIN_SEG_SEC = minseg;
+                                for BAND_W_HZ = GRID.BAND_W_HZ
+                                for DB_FLOOR_BAND = GRID.DB_FLOOR_BAND
+                                for RIDGE_LAMBDA = GRID.RIDGE_LAMBDA
+                                for F_JUMP_HZ = GRID.F_JUMP_HZ
+                                for BURNIN_SEC = GRID.BURNIN_SEC
+                                for K_EVENT = GRID.K_EVENT
+                                for PCHAIN_GAMMA = GRID.PCHAIN_GAMMA
+                                for PCHAIN_MAX = GRID.PCHAIN_MAX
+                                for HARM_REL_DB = HREL_list
+                                for HARM_MIN_BPM = HMIN_list
+                                for HARM_MAX_BPM = HMAX_list
+                                for MOVMEAN_SEC = GRID.MOVMEAN_SEC
 
-                            c.FS_TARGET = fs;
-                            c.IMETH     = IMETH;
+                                    id = id + 1;
+                                    C = struct();
+                                    C.cfg_id = id;
 
-                            c.WRAP_ON   = wrap_on;
-                            c.FLOW      = FLOW;
+                                    C.gap_thr = gap_thr;
+                                    C.MIN_SEG_SEC = MIN_SEG_SEC;
+                                    C.FS_TARGET = FS_TARGET;
+                                    C.IMETH = IMETH;
+                                    C.WRAP_ON = WRAP_ON;
+                                    C.FLOW = FLOW;
 
-                            c.GATE_ON     = gate_on;
-                            c.HR_MIN_BPM  = HR_MIN_BPM;
-                            c.HR_MAX_BPM  = HR_MAX_BPM;
-                            c.DELTA_DB    = DELTA_DB;
-                            c.SMOOTH_BINS = SMOOTH_BINS;
-                            c.GATE_FLOOR  = GATE_FLOOR;
+                                    C.BP_ON = BP_ON;
+                                    C.GATE_ON = GATE_ON;
+                                    C.HARM_ON = HARM_ON;
 
-                            c.BP_ON    = bp_on;
-                            c.BP_ORDER = BP_ORDER;
-                            c.BP_WI    = BP_WI;
-                            c.BP_WF    = BP_WF;
+                                    C.BP_ORDER = BP_ORDER;
+                                    C.BP_WI = BP_WI;
+                                    C.BP_WF = BP_WF;
 
-                            c.WI       = WI;
-                            c.WF       = WF;
-                            c.VOICES   = VOICES;
-                            c.CWT_WAVE = CWT_WAVE;
+                                    C.HR_MIN_BPM  = HR_MIN_BPM;
+                                    C.HR_MAX_BPM  = HR_MAX_BPM;
+                                    C.DELTA_DB    = DELTA_DB;
+                                    C.SMOOTH_BINS = SMOOTH_BINS;
+                                    C.GATE_FLOOR  = GATE_FLOOR;
 
-                            c.BAND_W_HZ      = BAND_W_HZ;
-                            c.DB_FLOOR_BAND  = DB_FLOOR_BAND;
-                            c.RIDGE_LAMBDA   = RIDGE_LAMBDA;
-                            c.F_JUMP_HZ      = F_JUMP_HZ;
-                            c.BURNIN_SEC     = BURNIN_SEC;
-                            c.K_EVENT        = K_EVENT;
-                            c.PCHAIN_GAMMA   = GAMMA;
-                            c.PCHAIN_MAX     = KMAX;
+                                    C.WI = WI; C.WF = WF;
+                                    C.VOICES = VOICES;
+                                    C.CWT_WAVE = CWT_WAVE;
 
-                            c.HARM_ON      = harm_on;
-                            c.HARM_REL_DB  = HARM_REL_DB;
-                            c.HARM_MIN_BPM = HARM_MIN_BPM;
-                            c.HARM_MAX_BPM = HARM_MAX_BPM;
+                                    C.BAND_W_HZ = BAND_W_HZ;
+                                    C.DB_FLOOR_BAND = DB_FLOOR_BAND;
+                                    C.RIDGE_LAMBDA = RIDGE_LAMBDA;
+                                    C.F_JUMP_HZ = F_JUMP_HZ;
+                                    C.BURNIN_SEC = BURNIN_SEC;
+                                    C.K_EVENT = K_EVENT;
+                                    C.PCHAIN_GAMMA = PCHAIN_GAMMA;
+                                    C.PCHAIN_MAX = PCHAIN_MAX;
 
-                            c.MOVMEAN_SEC = MOVMEAN_SEC;
+                                    C.HARM_REL_DB = HARM_REL_DB;
+                                    C.HARM_MIN_BPM = HARM_MIN_BPM;
+                                    C.HARM_MAX_BPM = HARM_MAX_BPM;
 
-                            cfgs = [cfgs; c]; %#ok<AGROW>
+                                    C.MOVMEAN_SEC = MOVMEAN_SEC;
 
-                        end; end; end; end; end; end; end; end; end; end; end; end; end; end
-                    end; end; end; end
-                    end; end; end; end; end
-                    end; end; end
-                    end; end; end; end
+                                    CFG = [CFG; C]; %#ok<AGROW>
+                                end
+                                end
+                                end
+                                end
+                                end
+                                end
+                                end
+                                end
+
+                            end
+                            end
+                        end
+                        end
+
+                    end
+                    end
+                    end
+                    end
                 end
+                end
+
             end
+            end
+            end
+
+        end
+        end
         end
 
+    end
+    end
+    end
+    end
+    end
+    end
 
-    CFG = cfgs;
+    fprintf('CFG built: %d configs\n', numel(CFG));
 end
-
-function [RMSEd, MAEd, CORRd, SCOREd, NVALd] = eval_one_cfg(cfg, CACHE, W_RMSE, W_MAE, W_1CORR)
-    nDS = numel(CACHE);
-
-    RMSEd  = nan(1,nDS);
-    MAEd   = nan(1,nDS);
-    CORRd  = nan(1,nDS);
-    SCOREd = nan(1,nDS);
-    NVALd  = zeros(1,nDS);
-
-    for d = 1:nDS
-        t0 = CACHE(d).t0;
-        if isempty(t0), continue; end
-
-        segments = segment_by_gaps(t0, cfg.gap_thr);
-
-        if cfg.WRAP_ON == 1
-            x0 = CACHE(d).x_wrap;
-        else
-            x0 = CACHE(d).x_unwrap;
-        end
-
-        [t_all, h_all] = radar_pipeline_segments(t0, x0, segments, cfg);
-
-        tP = CACHE(d).t_polar;
-        hP = CACHE(d).h_polar;
-
-        if isempty(tP) || isempty(hP) || isempty(t_all)
-            continue;
-        end
-
-        hC_onP = interp1(t_all, h_all, tP, 'linear', NaN);
-
-        m = isfinite(hC_onP) & isfinite(hP);
-        NVALd(d) = nnz(m);
-
-        if nnz(m) < 5
-            continue;
-        end
-
-        e = hC_onP(m) - hP(m);
-
-        RMSEd(d) = sqrt(mean(e.^2,'omitnan'));
-        MAEd(d)  = mean(abs(e),'omitnan');
-        CORRd(d) = corr(hC_onP(m), hP(m), 'Rows','complete');
-
-        corr_clamp = max(0, min(1, CORRd(d)));
-        SCOREd(d) = W_RMSE*RMSEd(d) + W_MAE*MAEd(d) + W_1CORR*(1 - corr_clamp);
+    end
     end
 end
+%% ===================== RUN ONE CONFIG (PIPELINE) =====================
+function [t_all, h_all] = run_one_cfg( ...
+    t0, x0, segments, ...
+    FS_TARGET, IMETH, MIN_SEG_SEC, ...
+    FLOW, ...
+    BP_ON, BP_ORDER, BP_WI, BP_WF, ...
+    GATE_ON, HR_MIN_BPM, HR_MAX_BPM, DELTA_DB, SMOOTH_BINS, GATE_FLOOR, ...
+    WI, WF, VOICES, CWT_WAVE, ...
+    BAND_W_HZ, DB_FLOOR_BAND, RIDGE_LAMBDA, F_JUMP_HZ, BURNIN_SEC, ...
+    K_EVENT, PCHAIN_GAMMA, PCHAIN_MAX, ...
+    HARM_ON, HARM_REL_DB, HARM_MIN_BPM, HARM_MAX_BPM, ...
+    MOVMEAN_SEC)
 
-function [t_all, h_all] = radar_pipeline_segments(t0, x0, segments, cfg)
-    FS = cfg.FS_TARGET;
-    dt = 1/FS;
+    dt = 1/FS_TARGET;
 
     tseg_list  = {};
     hrseg_list = {};
 
     for s = 1:size(segments,1)
         i0 = segments(s,1); i1 = segments(s,2);
+
         ts = t0(i0:i1);
         xs = x0(i0:i1);
 
-        [ts, iu] = unique(ts,'stable');
+        [ts, iu] = unique(ts, 'stable');
         xs = xs(iu);
 
         if numel(ts) < 8, continue; end
 
         tnew = (ts(1):dt:ts(end))';
-        xnew = interp1(ts, xs, tnew, cfg.IMETH);
+        xnew = interp1(ts, xs, tnew, IMETH);
 
         ok = isfinite(tnew) & isfinite(xnew);
         tnew = tnew(ok);
         xnew = xnew(ok);
 
         if numel(tnew) < 16, continue; end
-        if (tnew(end) - tnew(1)) < cfg.MIN_SEG_SEC, continue; end
+        if (tnew(end) - tnew(1)) < MIN_SEG_SEC, continue; end
 
-        x_fin = force_finite_vector(xnew);
+        xnew = force_finite_vector(xnew);
 
-        % ================= FLOW (com GATE/BP condicional) =================
-        if cfg.GATE_ON ~= 1
-            % GATE OFF => só BP se ON
-            if cfg.BP_ON == 1
-                x_fin = apply_bp_sos(x_fin, FS, cfg.BP_ORDER, cfg.BP_WI, cfg.BP_WF);
-            end
+        % ---------- FLOW (BP/GATE) com dummies ----------
+        x_fin = xnew;
+
+        if (GATE_ON ~= 1) && (BP_ON ~= 1)
+            % dummy total
+        elseif GATE_ON ~= 1
+            x_fin = apply_bp_sos_unitgain(x_fin, FS_TARGET, BP_ORDER, BP_WI, BP_WF, BP_ON);
+        elseif BP_ON ~= 1
+            x_fin = gate_by_power_hr_full(x_fin, FS_TARGET, ...
+                HR_MIN_BPM, HR_MAX_BPM, DELTA_DB, SMOOTH_BINS, GATE_FLOOR, GATE_ON);
         else
-            if strcmpi(cfg.FLOW,'BP_THEN_GATE')
-                if cfg.BP_ON == 1
-                    x_fin = apply_bp_sos(x_fin, FS, cfg.BP_ORDER, cfg.BP_WI, cfg.BP_WF);
-                end
-                x_fin = gate_by_power_hr_full(x_fin, FS, cfg.HR_MIN_BPM, cfg.HR_MAX_BPM, cfg.DELTA_DB, cfg.SMOOTH_BINS, cfg.GATE_FLOOR);
+            if strcmpi(FLOW,'BP_THEN_GATE')
+                x_fin = apply_bp_sos_unitgain(x_fin, FS_TARGET, BP_ORDER, BP_WI, BP_WF, BP_ON);
+                x_fin = gate_by_power_hr_full(x_fin, FS_TARGET, ...
+                    HR_MIN_BPM, HR_MAX_BPM, DELTA_DB, SMOOTH_BINS, GATE_FLOOR, GATE_ON);
             else
-                x_fin = gate_by_power_hr_full(x_fin, FS, cfg.HR_MIN_BPM, cfg.HR_MAX_BPM, cfg.DELTA_DB, cfg.SMOOTH_BINS, cfg.GATE_FLOOR);
-                if cfg.BP_ON == 1
-                    x_fin = apply_bp_sos(x_fin, FS, cfg.BP_ORDER, cfg.BP_WI, cfg.BP_WF);
-                end
+                x_fin = gate_by_power_hr_full(x_fin, FS_TARGET, ...
+                    HR_MIN_BPM, HR_MAX_BPM, DELTA_DB, SMOOTH_BINS, GATE_FLOOR, GATE_ON);
+                x_fin = apply_bp_sos_unitgain(x_fin, FS_TARGET, BP_ORDER, BP_WI, BP_WF, BP_ON);
             end
         end
 
         x_fin = force_finite_vector(x_fin);
 
-        % ================= CWT =================
-        [wt, fbin] = cwt(x_fin, cfg.CWT_WAVE, FS, ...
-            'FrequencyLimits',[cfg.WI cfg.WF], ...
-            'VoicesPerOctave', cfg.VOICES);
+        % ---------- CWT ----------
+        [wt, fbin] = cwt(x_fin, CWT_WAVE, FS_TARGET, ...
+            'FrequencyLimits',[WI WF], ...
+            'VoicesPerOctave', VOICES);
 
         fbin = fbin(:);
-        if numel(fbin)>1 && fbin(2) < fbin(1)
+        if numel(fbin)>1 && fbin(2)<fbin(1)
             fbin = flipud(fbin);
             wt   = flipud(wt);
         end
@@ -560,15 +512,16 @@ function [t_all, h_all] = radar_pipeline_segments(t0, x0, segments, cfg)
         clear wt;
         P(~isfinite(P)) = 0;
 
-        % ================= RIDGE (com HARM condicional) =================
-        freq_hz = ridge_area_punish_event_harm(P, fbin, FS, ...
-            cfg.BAND_W_HZ, cfg.DB_FLOOR_BAND, cfg.RIDGE_LAMBDA, cfg.F_JUMP_HZ, cfg.BURNIN_SEC, cfg.K_EVENT, cfg.PCHAIN_GAMMA, cfg.PCHAIN_MAX, ...
-            cfg.HARM_ON, cfg.HARM_REL_DB, cfg.HARM_MIN_BPM, cfg.HARM_MAX_BPM);
+        % ---------- RIDGE (+HARM dummy) ----------
+        freq_hz = ridge_area_punish_event_harm(P, fbin, FS_TARGET, ...
+            BAND_W_HZ, DB_FLOOR_BAND, RIDGE_LAMBDA, F_JUMP_HZ, BURNIN_SEC, ...
+            K_EVENT, PCHAIN_GAMMA, PCHAIN_MAX, ...
+            HARM_ON, HARM_REL_DB, HARM_MIN_BPM, HARM_MAX_BPM);
 
         hrseg = 60*freq_hz(:);
 
-        if cfg.MOVMEAN_SEC > 0
-            Wseg = max(1, round(cfg.MOVMEAN_SEC * FS));
+        if MOVMEAN_SEC > 0
+            Wseg = max(1, round(MOVMEAN_SEC * FS_TARGET));
             hrseg = movmean(hrseg, Wseg, 'Endpoints','shrink');
         end
 
@@ -579,75 +532,8 @@ function [t_all, h_all] = radar_pipeline_segments(t0, x0, segments, cfg)
     [t_all, h_all] = concat_segments(tseg_list, hrseg_list);
 end
 
-function print_top_aggr(CFG, idx, SCOREg, RMSEg, MAEg, CORRg)
-    for k = 1:numel(idx)
-        i = idx(k);
-        c = CFG(i);
-        fprintf('#%02d cfg_id=%d | SCOREg=%.4f RMSEg=%.4f MAEg=%.4f CORRg=%.4f | WRAP=%d FLOW=%s G=%d BP=%d H=%d | BP[%.2f %.2f] ord=%g | lam=%.3f jump=%.3f gamma=%.2f kmax=%g bw=%.2f\n', ...
-            k, c.cfg_id, SCOREg(i), RMSEg(i), MAEg(i), CORRg(i), ...
-            c.WRAP_ON, string(c.FLOW), c.GATE_ON, c.BP_ON, c.HARM_ON, ...
-            c.BP_WI, c.BP_WF, c.BP_ORDER, ...
-            c.RIDGE_LAMBDA, c.F_JUMP_HZ, c.PCHAIN_GAMMA, c.PCHAIN_MAX, c.BAND_W_HZ);
-    end
-end
+%% ===================== FUNÇÕES BASE (iguais/compatíveis com seu code) =====================
 
-function print_top_1ds(CFG, idx, SCORE, RMSE, MAE, CORR, NVAL)
-    for k = 1:numel(idx)
-        i = idx(k);
-        c = CFG(i);
-        fprintf('#%02d cfg_id=%d | SCORE=%.4f RMSE=%.4f MAE=%.4f CORR=%.4f N=%d | WRAP=%d FLOW=%s G=%d BP=%d H=%d | BP[%.2f %.2f] ord=%g | lam=%.3f jump=%.3f gamma=%.2f kmax=%g bw=%.2f\n', ...
-            k, c.cfg_id, SCORE(i), RMSE(i), MAE(i), CORR(i), NVAL(i), ...
-            c.WRAP_ON, string(c.FLOW), c.GATE_ON, c.BP_ON, c.HARM_ON, ...
-            c.BP_WI, c.BP_WF, c.BP_ORDER, ...
-            c.RIDGE_LAMBDA, c.F_JUMP_HZ, c.PCHAIN_GAMMA, c.PCHAIN_MAX, c.BAND_W_HZ);
-    end
-end
-
-function plot_best_cfg(cfg, CACHE)
-    figure('Color','w'); tiledlayout(numel(CACHE),1,'Padding','compact','TileSpacing','compact');
-    for d=1:numel(CACHE)
-        nexttile; hold on; grid on;
-        t0 = CACHE(d).t0;
-
-        segments = segment_by_gaps(t0, cfg.gap_thr);
-        if cfg.WRAP_ON==1, x0=CACHE(d).x_wrap; else, x0=CACHE(d).x_unwrap; end
-
-        [t_all, h_all] = radar_pipeline_segments(t0, x0, segments, cfg);
-
-        tP = CACHE(d).t_polar;
-        hP = CACHE(d).h_polar;
-
-        if isempty(tP) || isempty(hP) || isempty(t_all)
-            title(sprintf('%s | sem dados', CACHE(d).name)); continue;
-        end
-
-        hC_onP = interp1(t_all, h_all, tP, 'linear', NaN);
-
-        plot(tP, hP, 'c--', 'LineWidth', 1.2);
-        plot(tP, hC_onP, 'k-', 'LineWidth', 1.2);
-        xlabel('t (s)'); ylabel('HR (bpm)');
-        title(sprintf('%s | cfg_id=%d', CACHE(d).name, cfg.cfg_id));
-        legend('POLAR','RADAR@POLAR','Location','best');
-    end
-end
-
-%% ===================== LEITURA RADAR CSV =====================
-function [t_sec, phase] = read_radar_csv(path, col_t_ms, col_phase)
-    A = readmatrix(path);
-    if isempty(A) || size(A,2) < max(col_t_ms, col_phase)
-        t_sec = []; phase = []; return;
-    end
-    tpuro_ms = double(A(:, col_t_ms));
-    phase    = double(A(:, col_phase));
-    tpuro_ms = tpuro_ms(:);
-    phase    = phase(:);
-    ok = isfinite(tpuro_ms) & isfinite(phase);
-    tpuro_ms = tpuro_ms(ok);
-    phase    = phase(ok);
-    t_sec = (tpuro_ms - tpuro_ms(1))/1000;
-end
-
-%% ===================== SEGMENTAÇÃO / CONCAT =====================
 function segments = segment_by_gaps(t, gap_thr)
     t = t(:);
     n = numel(t);
@@ -672,14 +558,10 @@ function [t_all, h_all] = concat_segments(tseg_list, hseg_list)
         t_all = [t_all; tS]; %#ok<AGROW>
         h_all = [h_all; hS]; %#ok<AGROW>
     end
-    if isempty(t_all)
-        return;
-    end
     [t_all, iu] = unique(t_all, 'stable');
     h_all = h_all(iu);
 end
 
-%% ===================== WRAP / SANITIZE =====================
 function x = wrap_phase(ph)
     ph = double(ph(:));
     ph = force_finite_vector(ph);
@@ -690,7 +572,6 @@ end
 function x = force_finite_vector(x)
     x = double(x(:));
     ok = isfinite(x);
-
     if all(ok), return; end
 
     if nnz(ok) >= 2
@@ -699,37 +580,47 @@ function x = force_finite_vector(x)
     elseif nnz(ok) == 1
         x(~ok) = x(ok);
     else
-        x(:) = 0;
-        return;
+        x(:) = 0; return;
     end
 
     x(~isfinite(x)) = 0;
     if ~any(isfinite(x)), x(:) = 0; end
 end
 
-%% ===================== BANDPASS (SOS) =====================
-function x = apply_bp_sos(x, Fs, ord, wi, wf)
+% ======= BP com ganho unitário (DUMMY quando BP_ON=0) =======
+function x = apply_bp_sos_unitgain(x, Fs, ord, wi, wf, BP_ON)
     x = force_finite_vector(x);
+
+    if BP_ON ~= 1
+        return; % dummy
+    end
+
     if ~isfinite(Fs) || Fs<=0, return; end
-    if ~isfinite(ord) || ord<1, return; end
-    if ~isfinite(wi) || ~isfinite(wf), return; end
     if wf >= Fs/2, return; end
     if wi <= 0 || wi >= wf, return; end
 
     Wn = [wi wf]/(Fs/2);
 
-    use_sos = false;
     try
         [sosBP, gBP] = butter(ord, Wn, 'bandpass', 'sos');
-        use_sos = true;
     catch
-        use_sos = false;
-    end
-
-    if ~use_sos
         [z,p,k] = butter(ord, Wn, 'bandpass');
         sosBP = zp2sos(z,p,k);
         gBP = 1;
+    end
+
+    % Normaliza ganho em f0 (centro geométrico)
+    f0 = sqrt(wi*wf);
+    w0 = 2*pi*(f0/Fs);
+
+    try
+        H0 = freqz(sosBP, gBP, w0);
+        m0 = abs(H0);
+        if isfinite(m0) && m0 > 0
+            gBP = gBP / m0;
+        end
+    catch
+        % segue sem normalização se freqz falhar
     end
 
     if exist('sosfiltfilt','file') == 2
@@ -742,19 +633,18 @@ function x = apply_bp_sos(x, Fs, ord, wi, wf)
     x = force_finite_vector(x);
 end
 
-%% ===================== GATE (por potência fora da banda HR) =====================
-function xatt = gate_by_power_hr_full(x, FS, HR_MIN_BPM, HR_MAX_BPM, DELTA_DB, SMOOTH_BINS, GATE_FLOOR)
+% ======= GATE (DUMMY quando GATE_ON=0) =======
+function xatt = gate_by_power_hr_full(x, FS, HR_MIN_BPM, HR_MAX_BPM, DELTA_DB, SMOOTH_BINS, GATE_FLOOR, GATE_ON)
     x = force_finite_vector(x);
+
+    if GATE_ON ~= 1
+        xatt = x; return; % dummy
+    end
+
     N = numel(x);
     if N < 8 || ~isfinite(FS) || FS<=0
         xatt = x; return;
     end
-    if ~isfinite(HR_MIN_BPM) || ~isfinite(HR_MAX_BPM) || HR_MIN_BPM>=HR_MAX_BPM
-        xatt = x; return;
-    end
-    if ~isfinite(DELTA_DB), DELTA_DB = -3; end
-    if ~isfinite(SMOOTH_BINS), SMOOTH_BINS = 7; end
-    if ~isfinite(GATE_FLOOR), GATE_FLOOR = 0.0; end
 
     SPIKE_HALF  = 1;
     DO_W_SMOOTH = (SMOOTH_BINS > 1);
@@ -810,16 +700,12 @@ function xatt = gate_by_power_hr_full(x, FS, HR_MIN_BPM, HR_MAX_BPM, DELTA_DB, S
     xatt = force_finite_vector(xatt);
 end
 
-%% ===================== RIDGE (area + punish + event + harm) =====================
+% ===== ridge (o seu) =====
 function freq_hz = ridge_area_punish_event_harm(P, f_bin, srate, BAND_W_HZ, DB_FLOOR_BAND, RIDGE_LAMBDA, F_JUMP_HZ, BURNIN_SEC, K_EVENT, GAMMA, KMAX, ...
                                                 HARM_ON, HARM_REL_DB, HARM_MIN_BPM, HARM_MAX_BPM)
     f_bin = double(f_bin(:));
     nb = numel(f_bin);
     nt = size(P,2);
-
-    if nb < 2 || nt < 2
-        freq_hz = nan(nt,1); return;
-    end
 
     df = gradient(f_bin);
     df(df<=0) = eps;
@@ -850,7 +736,6 @@ function freq_hz = ridge_area_punish_event_harm(P, f_bin, srate, BAND_W_HZ, DB_F
     HARM_THR_LIN = 10^(HARM_REL_DB/10);
 
     imax = zeros(nt,1,'int32');
-
     prev_f_normal  = NaN;
     prev_was_event = false;
 
@@ -908,7 +793,6 @@ function freq_hz = ridge_area_punish_event_harm(P, f_bin, srate, BAND_W_HZ, DB_F
         if (tt > burnin_frames) && ~isnan(prev_for_punish) && (lambda_eff > 0)
             k = min(KMAX, punish_chain);
             lambda_chain = lambda_eff * exp(-GAMMA * k);
-
             jump = (fpeak - prev_for_punish) / (F_JUMP_HZ + eps);
             score_total(:) = score_total(:) - lambda_chain * (jump.^2);
             punish_applied = true;
@@ -938,7 +822,6 @@ function freq_hz = ridge_area_punish_event_harm(P, f_bin, srate, BAND_W_HZ, DB_F
         imax(tt) = kpeak(i_best);
 
         p_peak = pcol(double(imax(tt)));
-
         if ~is_event
             prev_f_normal = f_bin(double(imax(tt)));
             [sorted_peak, n_sorted] = sorted_insert(sorted_peak, n_sorted, single(p_peak));
@@ -983,7 +866,6 @@ function [a, n] = sorted_insert(a, n, x)
     n = n + 1;
 end
 
-%% ===================== POLAR READER =====================
 function [t_sec, HR] = read_txt_polar_flex(p)
     fid = fopen(p,'r');
     if fid == -1
@@ -1013,11 +895,7 @@ function [t_sec, HR] = read_txt_polar_flex(p)
     try
         t_dt = datetime(ts_str,'InputFormat',"yyyy-MM-dd'T'HH:mm:ss.SSS");
     catch
-        try
-            t_dt = datetime(ts_str,'InputFormat',"yyyy-MM-dd HH:mm:ss.SSS");
-        catch
-            t_dt = datetime(ts_str);
-        end
+        t_dt = datetime(ts_str,'InputFormat',"yyyy-MM-dd HH:mm:ss.SSS");
     end
 
     t_sec = seconds(t_dt - t_dt(1));
