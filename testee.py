@@ -21,8 +21,8 @@ DEVICE_NAME = "ESP32C3_IC"
 CHAR_UUID   = "00001234-0000-1000-8000-00805f9b34fb"
 
 CFG = dict(
-    N=64,
-    hop=32,
+    N=32,
+    hop=16,
     f_min_hz=0.05,
     harm_on=1,
     harm_max=3,
@@ -194,15 +194,21 @@ class State:
         self.t = deque(maxlen=200000)
         self.x = deque(maxlen=200000)
 
+        self.t_total  = deque(maxlen=30000)
+        self.total    = deque(maxlen=30000)
+        self.t_breath = deque(maxlen=30000)
+        self.breath   = deque(maxlen=30000)
+        self.t_heart  = deque(maxlen=30000)
+        self.heart    = deque(maxlen=30000)
+
+        self.t_hf     = deque(maxlen=30000)
+        self.heart_f  = deque(maxlen=30000)
+
         self.hr_t = deque(maxlen=MAXP)
         self.hr   = deque(maxlen=MAXP)
 
         self.fs_t = deque(maxlen=MAXP)
         self.fs   = deque(maxlen=MAXP)
-
-        self.sig_t    = deque(maxlen=8000)
-        self.sig_raw  = deque(maxlen=8000)
-        self.sig_filt = deque(maxlen=8000)
 
         self.good = 0
         self.bad  = 0
@@ -311,17 +317,15 @@ def process_if_possible(st: State, max_windows=2):
             else:
                 bp_err = err if err else "bp_unknown"
 
-        t0 = time.perf_counter()
         hr = estimate_hr_window(
             x_use, fs, CFG["f_min_hz"],
             CFG["harm_on"], CFG["harm_max"], CFG["harm_tol"], CFG["harm_ratio"]
         )
-        t1 = time.perf_counter()
-        _proc_ms = 1000.0 * (t1 - t0)
 
         with st.lock:
             st.win_id += 1
             win_id = st.win_id
+
             if BP.get("on", 1):
                 if bp_ok:
                     st.filter_ok += 1
@@ -336,15 +340,11 @@ def process_if_possible(st: State, max_windows=2):
 
             t_tail = tw[-hop:] if hop <= tw.size else tw
             raw_tail = xw_raw[-hop:] if hop <= xw_raw.size else xw_raw
-            if bp_ok:
-                filt_tail = x_use[-hop:] if hop <= x_use.size else x_use
-            else:
-                filt_tail = raw_tail
+            filt_tail = (x_use[-hop:] if hop <= x_use.size else x_use) if bp_ok else raw_tail
 
             for i in range(len(t_tail)):
-                st.sig_t.append(float(t_tail[i]))
-                st.sig_raw.append(float(raw_tail[i]))
-                st.sig_filt.append(float(filt_tail[i]))
+                st.t_hf.append(float(t_tail[i]))
+                st.heart_f.append(float(filt_tail[i]))
 
         x_filt_for_csv = x_use if bp_ok else xw_raw
         _csv_enqueue_window(
@@ -366,7 +366,7 @@ def process_if_possible(st: State, max_windows=2):
 
 def make_gui():
     plt.ion()
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(11, 7), sharex=True)
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
 
     l_hr, = ax1.plot([], [], lw=1.5)
     p_hr, = ax1.plot([], [], linestyle="none", marker="o", markersize=4)
@@ -378,19 +378,21 @@ def make_gui():
     ax2.set_ylabel("Fs_win (Hz)")
     ax2.grid(True)
 
-    l_raw,  = ax3.plot([], [], lw=1.0)
-    l_filt, = ax3.plot([], [], lw=1.0)
-    ax3.set_ylabel("heart_phase (raw/filt)")
+    l_tot, = ax3.plot([], [], lw=1.0)
+    l_bre, = ax3.plot([], [], lw=1.0)
+    l_hea, = ax3.plot([], [], lw=1.0)
+    l_hf,  = ax3.plot([], [], lw=1.5)
+    ax3.set_ylabel("phases (raw) + heart_filt")
     ax3.set_xlabel("t (s)")
     ax3.grid(True)
-    ax3.legend(["raw", "filt"], loc="upper right")
+    ax3.legend(["total", "breath", "heart", "heart_filt"], loc="upper right")
 
     fig.tight_layout()
-    return fig, (ax1, ax2, ax3), (l_hr, p_hr, l_fs, p_fs, l_raw, l_filt)
+    return fig, (ax1, ax2, ax3), (l_hr, p_hr, l_fs, p_fs, l_tot, l_bre, l_hea, l_hf)
 
 
 def gui_loop(st: State):
-    fig, (ax1, ax2, ax3), (l_hr, p_hr, l_fs, p_fs, l_raw, l_filt) = make_gui()
+    fig, (ax1, ax2, ax3), (l_hr, p_hr, l_fs, p_fs, l_tot, l_bre, l_hea, l_hf) = make_gui()
     period = 1.0 / GUI_REFRESH_HZ
 
     while plt.fignum_exists(fig.number):
@@ -401,12 +403,21 @@ def gui_loop(st: State):
             t_fs = np.asarray(st.fs_t, dtype=float)
             y_fs = np.asarray(st.fs, dtype=float)
 
-            ts = np.asarray(st.sig_t, dtype=float)
-            xr = np.asarray(st.sig_raw, dtype=float)
-            xf = np.asarray(st.sig_filt, dtype=float)
+            tt = np.asarray(st.t_total, dtype=float)
+            yt = np.asarray(st.total, dtype=float)
+
+            tb = np.asarray(st.t_breath, dtype=float)
+            yb = np.asarray(st.breath, dtype=float)
+
+            th = np.asarray(st.t_heart, dtype=float)
+            yh = np.asarray(st.heart, dtype=float)
+
+            thf = np.asarray(st.t_hf, dtype=float)
+            yhf = np.asarray(st.heart_f, dtype=float)
 
             good, bad, back = st.good, st.bad, st.ts_back
             fok, ffl, ferr = st.filter_ok, st.filter_fail, st.filter_last_err
+            csv_path = st.csv_path
 
         if t_hr.size > 0:
             l_hr.set_data(t_hr, y_hr)
@@ -418,14 +429,21 @@ def gui_loop(st: State):
             p_fs.set_data(t_fs, y_fs)
             ax2.relim(); ax2.autoscale_view()
 
-        if ts.size > 1:
-            l_raw.set_data(ts, xr)
-            l_filt.set_data(ts, xf)
+        if tt.size > 1:
+            l_tot.set_data(tt, yt)
+        if tb.size > 1:
+            l_bre.set_data(tb, yb)
+        if th.size > 1:
+            l_hea.set_data(th, yh)
+        if thf.size > 1:
+            l_hf.set_data(thf, yhf)
+
+        if (tt.size > 1) or (tb.size > 1) or (th.size > 1) or (thf.size > 1):
             ax3.relim(); ax3.autoscale_view()
 
         bp_txt = f"BP={'ON' if BP.get('on',1) else 'OFF'} {BP['wi']:.2f}-{BP['wf']:.2f}Hz Rs={BP['Rs']:.0f} ford={BP['ford']}"
         filt_txt = f"bp_ok={fok} bp_fail={ffl}" + (f" last={ferr}" if (ffl > 0 and ferr) else "")
-        csv_txt = f"csv={st.csv_path}" if (CSV_ON and st.csv_path) else "csv=OFF"
+        csv_txt = f"csv={csv_path}" if (CSV_ON and csv_path) else "csv=OFF"
 
         ax1.set_title(
             f"good={good} bad={bad} ts_back={back} | N={CFG['N']} hop={CFG['hop']} | {bp_txt} | {filt_txt} | {csv_txt}"
@@ -496,6 +514,11 @@ async def main():
         with st.lock:
             st.t.append(t_sec)
             st.x.append(float(heart))
+
+            st.t_total.append(t_sec);  st.total.append(float(total))
+            st.t_breath.append(t_sec); st.breath.append(float(breath))
+            st.t_heart.append(t_sec);  st.heart.append(float(heart))
+
             st.good += 1
             good = st.good
 
