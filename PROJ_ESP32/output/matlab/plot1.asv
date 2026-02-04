@@ -1,576 +1,304 @@
 clc; clear; close all;
 
 %% ========================== PATHS (3 DUPLAS) ==========================
-% Você pediu: polarh2 + phases, polarh3 + phases_raw, polarh10 + phase
-BASE = "C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\";
-
-DATASETS = [
-    struct("name","H2",  "radar", BASE+"phases.csv",      "polar", BASE+"POLARH2.txt")
-    struct("name","H3",  "radar", BASE+"phases_raw.csv",  "polar", BASE+"POLARH3.txt")
-    struct("name","H10", "radar", BASE+"phase.csv",       "polar", BASE+"POLARH10.txt")
+BASE = "C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\";
+DATASETS = [ ...
+    struct("name","H2",  "radar", BASE+"phases.csv",     "polar", BASE+"POLARH2.txt"), ...
+    struct("name","H3",  "radar", BASE+"phases_raw.csv", "polar", BASE+"POLARH3.txt"), ...
+    struct("name","H10", "radar", BASE+"phase.csv",      "polar", BASE+"POLARH10.txt") ...
 ];
 
 %% ===================== FIXOS =====================
-GAP_THR_SEC = 0.6;      % segmentação por buracos (s)
-FS_TARGET   = 25.0;     % Hz (resample uniforme)
+GAP_THR_SEC = 0.6;
+FS_TARGET   = 50.0;
 
-COL_T_MS  = 1;          % ms
-COL_HEART = 2;          % coluna do sinal (fase/heart)
+COL_T_MS   = 1;
+COL_HEART  = 2;
 
-DT_GRID       = 0.1;    % grid comum para métricas
-SMOOTH_HR_SEC = 7.0;    % suavização do HR no grid comum
-F_MIN_HZ      = 0.05;   % ignora DC/baixíssima freq no pico
+DT_GRID        = 0.1;
+SMOOTH_HR_SEC  = 7.0;
+F_MIN_HZ       = 0.05;
 
-% Score agregado (maior melhor)
-SCORE_ALPHA = 0.05;     % score = Corr_mean - alpha*MAE_mean
-
-% Regras de qualidade mínimas
 MIN_POINTS_AFTER_RESAMPLE = 32;
 MIN_METRIC_SAMPLES        = 10;
 
-%% ===================== GRIDS (PENTE FINO - BASEADO NOS TOPS) =====================
-% FFT
-NPERSEG_GRID   = [32 64];
-HOP_RATIO_GRID = [0.1875 0.50];           % 32->6 e 32->16 | 64->12 e 64->32  (hop=round(N*ratio))
+CFG.N      = 64;
+CFG.hop    = 16;
+CFG.WRAP   = 0;
 
-% wrap
-WRAP_GRID = [0];                          % (mantém como você colocou)
+CFG.win    = "flattop";
+CFG.ftype  = "cheby2";
+CFG.ford   = 4;
+CFG.wi     = 0.80;
+CFG.wf     = 2.00;
 
-% windows (agora FUNCIONA de verdade)
-WINDOW_GRID = ["rect","blackmanharris","flattop","nuttall","bohmanwin","bartlett","triang","parzenwin", ...
-               "kaiser:8","tukey:0.50","cheb:80","gauss:3.5"];
+CFG.harm_on    = 1;
+CFG.harm_max   = 3;
+CFG.harm_tol   = 1;
+CFG.harm_ratio = 0.20;
 
-% filtro (só cheby2 como você pediu)
-FILTER_TYPE_GRID  = ["cheby2"];
-FILTER_ORDER_GRID = [4];                  % (se quiser também testar ord=2, coloca [2 4])
+fprintf('\n==================== CONFIG DEFINITIVA ====================\n');
+fprintf('N=%d hop=%d WRAP=%d win=%s | filt=%s ord=%d wi=%.2f wf=%.2f | harm=%d (max=%d tol=%d ratio=%.2f)\n', ...
+    CFG.N, CFG.hop, CFG.WRAP, CFG.win, CFG.ftype, CFG.ford, CFG.wi, CFG.wf, ...
+    CFG.harm_on, CFG.harm_max, CFG.harm_tol, CFG.harm_ratio);
 
-% bandas
-WI_GRID = [0.5 0.80];
-WF_GRID = [2.00 2.50 3.00];
+%% ===================== RUN =====================
+Corrs = []; MAEs = []; RMSEs = []; used = 0;
 
-% harmônicos
-HARM_ON_GRID = [0 1];
-HARM_MAX_ORDER_GRID = [3];
-HARM_TOL_BINS_GRID  = [1 2 3];
-HARM_RATIO_MIN_GRID = [0.20 0.50];        % (você tinha 0.2 e 0.50 mesmo)
-
-% poda: harm ON só com N>=HARM_ON_MIN_N
-HARM_ON_MIN_N = 32;
-
-%% ===================== PRÉ-LOAD (3 duplas) =====================
-D = repmat(struct(), numel(DATASETS), 1);
-
-fprintf('\n==================== LOADING DATASETS ====================\n');
+fprintf('\n==================== RUN (DEFINITIVO) ====================\n');
 for d = 1:numel(DATASETS)
-    fprintf('[LOAD] %s | radar=%s | polar=%s\n', DATASETS(d).name, DATASETS(d).radar, DATASETS(d).polar);
+    fprintf('\n[DATASET] %s\n', DATASETS(d).name);
 
-    A = readmatrix(DATASETS(d).radar);
-    tpuro = A(:,COL_T_MS);
-    heart = A(:,COL_HEART);
+    A    = readmatrix(DATASETS(d).radar);
+    t_ms = A(:,COL_T_MS);
+    xraw = A(:,COL_HEART);
 
-    t0 = (tpuro - tpuro(1)) / 1000;
+    t0   = (t_ms - t_ms(1))/1000;
     seg0 = segment_by_gaps(t0, GAP_THR_SEC);
 
-    t_polar = []; HR_polar = [];
     try
         [t_polar, HR_polar] = read_txt_polar(DATASETS(d).polar);
         [t_polar, ia] = unique(t_polar,'stable');
         HR_polar = HR_polar(ia);
+        hasPolar = ~isempty(t_polar) && ~isempty(HR_polar);
     catch
-        t_polar = []; HR_polar = [];
+        hasPolar = false;
+    end
+    if ~hasPolar
+        fprintf(' [SKIP] Polar indisponível.\n');
+        continue;
     end
 
-    D(d).name   = DATASETS(d).name;
-    D(d).t0     = t0;
-    D(d).seg0   = seg0;
-    D(d).heart0 = heart;
-    D(d).tp     = t_polar;
-    D(d).HRp    = HR_polar;
-    D(d).hasPolar = ~isempty(t_polar) && ~isempty(HR_polar);
-
-    if ~D(d).hasPolar
-        fprintf('  [WARN] %s: Polar indisponível/erro de leitura.\n', D(d).name);
-    end
-end
-
-%% ===================== ENUMERA CONFIGS (PENTE FINO + PODAS) =====================
-cfgList = [];
-
-for N = NPERSEG_GRID
-    for hopRatio = HOP_RATIO_GRID
-        hop = max(1, round(N * hopRatio));
-        hop = min(hop, N-1);
-
-        for WRAP = WRAP_GRID
-            for win = WINDOW_GRID
-                for ftype = FILTER_TYPE_GRID
-                    for ord = FILTER_ORDER_GRID
-                        for wi = WI_GRID
-                            for wf = WF_GRID
-
-                                if ~(isfinite(wi) && isfinite(wf) && wf > wi), continue; end
-                                if wf >= FS_TARGET/2, continue; end
-
-                                for harm_on = HARM_ON_GRID
-                                    if harm_on == 1 && N < HARM_ON_MIN_N
-                                        continue;
-                                    end
-
-                                    if harm_on == 0
-                                        hmaxList = 0; htolList = 0; hratList = 0;
-                                    else
-                                        hmaxList = HARM_MAX_ORDER_GRID;
-                                        htolList = HARM_TOL_BINS_GRID;
-                                        hratList = HARM_RATIO_MIN_GRID;
-                                    end
-
-                                    for hmax = hmaxList
-                                        for htol = htolList
-                                            for hrat = hratList
-
-                                                cfg.N = N;
-                                                cfg.hop = hop;
-                                                cfg.WRAP = WRAP;
-
-                                                cfg.win = win;
-                                                cfg.ftype = ftype;
-                                                cfg.ford  = ord;
-                                                cfg.wi = wi;
-                                                cfg.wf = wf;
-
-                                                cfg.harm_on = harm_on;
-                                                cfg.harm_max = hmax;
-                                                cfg.harm_tol = htol;
-                                                cfg.harm_ratio = hrat;
-
-                                                cfgList = [cfgList; cfg]; %#ok<AGROW>
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-end
-
-TOTAL = numel(cfgList);
-fprintf('\n==================== PENTE FINO ====================\n');
-fprintf('[GRID] Total de configs = %d\n', TOTAL);
-
-%% ===================== RODA GRID =====================
-RES = repmat(struct( ...
-    "score",nan,"corr",nan,"mae",nan,"rmse",nan,"nsets",0, ...
-    "N",0,"hop",0,"WRAP",0,"win","","ftype","","ford",0,"wi",0,"wf",0, ...
-    "harm_on",0,"harm_max",0,"harm_tol",0,"harm_ratio",0), TOTAL, 1);
-
-tStart = tic;
-
-fprintf('\n==================== RUN ====================\n');
-for i = 1:TOTAL
-    c = cfgList(i);
-
-    Corrs = []; MAEs = []; RMSEs = [];
-    nUseSets = 0;
-
-    for d = 1:numel(D)
-        if ~D(d).hasPolar, continue; end
-
-        % ===== WRAP OU NÃO (antes do resample) =====
-        if c.WRAP
-            x0 = wrap_phase(D(d).heart0);
-        else
-            x0 = prep_nowrap(D(d).heart0);
-        end
-
-        % ===== RESAMPLE irregular -> FS_TARGET por segmento =====
-        [t_u, x_u] = resample_segments_irregular(D(d).t0, x0, D(d).seg0, FS_TARGET, 'linear');
-        if numel(x_u) < max(MIN_POINTS_AFTER_RESAMPLE, c.N)
-            continue;
-        end
-
-        % ===== FILTRO (SEM GAUSS) =====
-        x_f = zero_phase_bandpass_any(x_u, FS_TARGET, c.wi, c.wf, c.ford, c.ftype);
-
-        % ===== TRACK rFFT/HOP =====
-        [t_frames, f_hz] = rfft_fundamental_track_hop(t_u, x_f, FS_TARGET, ...
-            c.N, c.hop, c.win, F_MIN_HZ, ...
-            c.harm_on, c.harm_max, c.harm_tol, c.harm_ratio);
-
-        if isempty(t_frames), continue; end
-        hr_bpm = 60 * f_hz;
-
-        % ===== GRID COMUM + SUAVIZAÇÃO + MÉTRICAS =====
-        t_polar = D(d).tp; HR_polar = D(d).HRp;
-
-        t_start  = max(min(t_frames), min(t_polar));
-        t_end    = min(max(t_frames), max(t_polar));
-        if ~(isfinite(t_start) && isfinite(t_end) && t_end > t_start)
-            continue;
-        end
-
-        t_common = (t_start : DT_GRID : t_end)';
-
-        HR_radar_grid = smooth_in_time_to_grid(t_frames, hr_bpm, t_common, DT_GRID, SMOOTH_HR_SEC);
-        HR_polar_grid = interp_common(t_polar, HR_polar, t_common);
-
-        [MAE, RMSE, R, n] = metrics(HR_radar_grid, HR_polar_grid);
-        if ~(isfinite(MAE) && isfinite(R) && n >= MIN_METRIC_SAMPLES)
-            continue;
-        end
-
-        Corrs(end+1,1) = R;    %#ok<AGROW>
-        MAEs(end+1,1)  = MAE;  %#ok<AGROW>
-        RMSEs(end+1,1) = RMSE; %#ok<AGROW>
-        nUseSets = nUseSets + 1;
-    end
-
-    if nUseSets >= 1
-        corr_m = mean(Corrs);
-        mae_m  = mean(MAEs);
-        rmse_m = mean(RMSEs);
-        score  = corr_m - SCORE_ALPHA*mae_m;
+    if CFG.WRAP
+        x0 = wrap_phase(xraw);
     else
-        corr_m = nan; mae_m = nan; rmse_m = nan; score = nan;
+        x0 = prep_nowrap(xraw);
     end
 
-    RES(i).score = score;
-    RES(i).corr  = corr_m;
-    RES(i).mae   = mae_m;
-    RES(i).rmse  = rmse_m;
-    RES(i).nsets = nUseSets;
-
-    RES(i).N = c.N;
-    RES(i).hop = c.hop;
-    RES(i).WRAP = c.WRAP;
-    RES(i).win  = char(c.win);
-    RES(i).ftype = char(c.ftype);
-    RES(i).ford  = c.ford;
-    RES(i).wi    = c.wi;
-    RES(i).wf    = c.wf;
-    RES(i).harm_on    = c.harm_on;
-    RES(i).harm_max   = c.harm_max;
-    RES(i).harm_tol   = c.harm_tol;
-    RES(i).harm_ratio = c.harm_ratio;
-
-    % ===== PRINT PROGRESSO =====
-    if mod(i, max(1, floor(TOTAL/50))) == 0 || i == 1 || i == TOTAL
-        elapsed = toc(tStart);
-        fprintf('[%6d/%6d] %.1f%% | elapsed %.1fs | last: score=%.4f corr=%.4f mae=%.3f (sets=%d) | N=%d hop=%d wrap=%d win=%s wi=%.2f wf=%.2f harm=%d\n', ...
-            i, TOTAL, 100*i/TOTAL, elapsed, score, corr_m, mae_m, nUseSets, ...
-            c.N, c.hop, c.WRAP, string(c.win), c.wi, c.wf, c.harm_on);
+    [t_u, x_u] = resample_segments_irregular(t0, x0, seg0, FS_TARGET, 'linear');
+    if numel(x_u) < max(MIN_POINTS_AFTER_RESAMPLE, CFG.N)
+        fprintf(' [SKIP] Poucos pontos após resample: %d\n', numel(x_u));
+        continue;
     end
+
+    x_f = zero_phase_bandpass_cheby2(x_u, FS_TARGET, CFG.wi, CFG.wf, CFG.ford);
+
+    [t_frames, f_hz] = rfft_fundamental_track_hop(t_u, x_f, FS_TARGET, ...
+        CFG.N, CFG.hop, F_MIN_HZ, ...
+        CFG.harm_on, CFG.harm_max, CFG.harm_tol, CFG.harm_ratio);
+
+    if isempty(t_frames)
+        fprintf(' [SKIP] Track vazio.\n');
+        continue;
+    end
+
+    hr_bpm = 60 * f_hz;
+
+    t_start = max(min(t_frames), min(t_polar));
+    t_end   = min(max(t_frames), max(t_polar));
+    if ~(isfinite(t_start) && isfinite(t_end) && t_end > t_start)
+        fprintf(' [SKIP] Janela comum inválida.\n');
+        continue;
+    end
+
+    t_common       = (t_start:DT_GRID:t_end)';
+    HR_radar_grid  = smooth_in_time_to_grid(t_frames, hr_bpm, t_common, DT_GRID, SMOOTH_HR_SEC);
+    HR_polar_grid  = interp_common(t_polar, HR_polar, t_common);
+
+    [MAE, RMSE, R, n] = metrics(HR_radar_grid, HR_polar_grid);
+    if ~(isfinite(MAE) && isfinite(R) && n >= MIN_METRIC_SAMPLES)
+        fprintf(' [SKIP] Métrica inválida (n=%d).\n', n);
+        continue;
+    end
+
+    used = used + 1;
+    Corrs(end+1,1) = R; %#ok<AGROW>
+    MAEs(end+1,1)  = MAE; %#ok<AGROW>
+    RMSEs(end+1,1) = RMSE; %#ok<AGROW>
+
+    fprintf(' OK | corr=%.4f | MAE=%.3f | RMSE=%.3f | n=%d\n', R, MAE, RMSE, n);
+
+    figure('Name', "DEFINITIVO - "+DATASETS(d).name);
+    plot(t_common, HR_polar_grid); hold on;
+    plot(t_common, HR_radar_grid);
+    grid on; xlabel('t (s)'); ylabel('HR (bpm)');
+    legend('Polar (grid)','Radar (grid)');
+    title(sprintf('DEFINITIVO %s | corr=%.3f MAE=%.2f RMSE=%.2f', DATASETS(d).name, R, MAE, RMSE));
 end
 
-%% ===================== TOP 5 (SCORE, CORR, MAE) =====================
-valid = arrayfun(@(s) isfinite(s.score) && isfinite(s.corr) && isfinite(s.mae) && s.nsets>=1, RES);
-R0 = RES(valid);
-
-if isempty(R0)
-    fprintf('\n[TOP] Nenhuma configuração válida.\n');
-    return;
+fprintf('\n==================== SUMMARY ====================\n');
+if used == 0
+    fprintf('Nenhum dataset válido.\n');
+else
+    fprintf('Datasets usados: %d/%d\n', used, numel(DATASETS));
+    fprintf('corr_mean=%.4f | MAE_mean=%.3f | RMSE_mean=%.3f\n', mean(Corrs), mean(MAEs), mean(RMSEs));
 end
-
-fprintf('\n==================== TOP 5 por SCORE ====================\n');
-[~, idx] = sort([R0.score], 'descend');
-print_top(R0(idx), 5);
-
-fprintf('\n==================== TOP 5 por CORR ======================\n');
-[~, idx] = sort([R0.corr], 'descend');
-print_top(R0(idx), 5);
-
-fprintf('\n==================== TOP 5 por MENOR MAE =================\n');
-[~, idx] = sort([R0.mae], 'ascend');
-print_top(R0(idx), 5);
 
 %% ========================== FUNÇÕES ==========================
-function print_top(R, K)
-    K = min(K, numel(R));
-    for i = 1:K
-        s = R(i);
-        fprintf('#%d | score=%.4f | corr=%.4f | MAE=%.3f | RMSE=%.3f | sets=%d | N=%d hop=%d | WRAP=%d | win=%s | filt=%s ord=%d wi=%.2f wf=%.2f | harm=%d (max=%d tol=%d ratio=%.2f)\n', ...
-            i, s.score, s.corr, s.mae, s.rmse, s.nsets, ...
-            s.N, s.hop, s.WRAP, string(s.win), s.ftype, s.ford, s.wi, s.wf, ...
-            s.harm_on, s.harm_max, s.harm_tol, s.harm_ratio);
-    end
-end
-
 function x = prep_nowrap(x)
-    x = double(x(:));
-    ok = isfinite(x);
-    if ~all(ok)
-        x(~ok) = interp1(find(ok), x(ok), find(~ok), 'linear', 'extrap');
-    end
-    x = x - mean(x,'omitnan');
+x = double(x(:));
+ok = isfinite(x);
+if ~all(ok)
+    x(~ok) = interp1(find(ok), x(ok), find(~ok), 'linear', 'extrap');
+end
+x = x - mean(x,'omitnan');
 end
 
 function ph_wrapped = wrap_phase(ph)
-    ph = double(ph(:));
-    ok = isfinite(ph);
-    if ~all(ok)
-        ph(~ok) = interp1(find(ok), ph(ok), find(~ok), 'linear', 'extrap');
-    end
-    ph_wrapped = mod(ph + pi, 2*pi) - pi;
-    ph_wrapped = ph_wrapped - mean(ph_wrapped,'omitnan');
+ph = double(ph(:));
+ok = isfinite(ph);
+if ~all(ok)
+    ph(~ok) = interp1(find(ok), ph(ok), find(~ok), 'linear', 'extrap');
+end
+ph_wrapped = mod(ph + pi, 2*pi) - pi;
+ph_wrapped = ph_wrapped - mean(ph_wrapped,'omitnan');
 end
 
 function segments = segment_by_gaps(t, gap_thr)
-    t = t(:);
-    n = numel(t);
-    if n < 2
-        segments = [1 n];
-        return;
-    end
-    breaks = find(diff(t) > gap_thr);
-    if isempty(breaks)
-        segments = [1 n];
-    else
-        segments = [[1; breaks+1], [breaks; n]];
-    end
+t = t(:);
+n = numel(t);
+if n < 2, segments = [1 n]; return; end
+breaks = find(diff(t) > gap_thr);
+if isempty(breaks)
+    segments = [1 n];
+else
+    segments = [[1; breaks+1], [breaks; n]];
+end
 end
 
 function [t_u, x_u] = resample_segments_irregular(t, x, segments, fs_target, method)
-    t = t(:); x = x(:);
-    dt = 1/fs_target;
-    t_u = [];
-    x_u = [];
-    for k = 1:size(segments,1)
-        i0 = segments(k,1); i1 = segments(k,2);
-        ts = t(i0:i1); xs = x(i0:i1);
-        [ts, iu] = unique(ts,'stable'); xs = xs(iu);
-        if numel(ts) < 4, continue; end
-        tnew = (ts(1):dt:ts(end))';
-        xnew = interp1(ts, xs, tnew, method);
-        ok = isfinite(tnew) & isfinite(xnew);
-        t_u = [t_u; tnew(ok)];
-        x_u = [x_u; xnew(ok)];
-    end
-    [t_u, iu] = unique(t_u,'stable');
-    x_u = x_u(iu);
+t = t(:); x = x(:);
+dt = 1/fs_target;
+t_u = []; x_u = [];
+for k = 1:size(segments,1)
+    i0 = segments(k,1); i1 = segments(k,2);
+    ts = t(i0:i1); xs = x(i0:i1);
+    [ts, iu] = unique(ts,'stable'); xs = xs(iu);
+    if numel(ts) < 4, continue; end
+    tnew = (ts(1):dt:ts(end))';
+    xnew = interp1(ts, xs, tnew, method);
+    ok = isfinite(tnew) & isfinite(xnew);
+    t_u = [t_u; tnew(ok)]; %#ok<AGROW>
+    x_u = [x_u; xnew(ok)]; %#ok<AGROW>
+end
+[t_u, iu] = unique(t_u,'stable');
+x_u = x_u(iu);
 end
 
-function y = zero_phase_bandpass_any(x, fs, wi_hz, wf_hz, order_final, ftype)
-    x = x(:);
-    if numel(x) < 16, y = x; return; end
-    if wf_hz >= fs/2, y = x; return; end
-    if wi_hz <= 0 || wi_hz >= wf_hz, y = x; return; end
-
-    ftype = lower(string(ftype));
-
-    switch ftype
-        case "cheby2"
-            if mod(order_final,2)~=0, y = x; return; end
-            n  = order_final/2;
-            Rs = 30; % stopband dB (fixo)
-            [b,a] = cheby2(n, Rs, [wi_hz wf_hz]/(fs/2), 'bandpass');
-        otherwise
-            y = x; return;
-    end
-
-    padlen = 3*(max(length(a), length(b)) - 1);
-    if numel(x) <= padlen
-        y = x; return;
-    end
-
-    y = filtfilt(b,a,x);
+function y = zero_phase_bandpass_cheby2(x, fs, wi_hz, wf_hz, order_final)
+x = x(:);
+if numel(x) < 16 || wf_hz >= fs/2 || wi_hz <= 0 || wi_hz >= wf_hz || mod(order_final,2)~=0
+    y = x; return;
+end
+n = order_final/2;
+Rs = 30;
+[b,a] = cheby2(n, Rs, [wi_hz wf_hz]/(fs/2), 'bandpass');
+padlen = 3*(max(length(a), length(b)) - 1);
+if numel(x) <= padlen, y = x; return; end
+y = filtfilt(b,a,x);
 end
 
-function [t_frames, fpk_hz] = rfft_fundamental_track_hop(tu, xu, fs, nperseg, hop, winName, f_min_hz, ...
-    harm_on, harm_max_order, harm_tol_bins, harm_ratio_min)
+function [t_frames, fpk_hz] = rfft_fundamental_track_hop(tu, xu, fs, nperseg, hop, f_min_hz, harm_on, harm_max_order, harm_tol_bins, harm_ratio_min)
+tu = tu(:); xu = xu(:);
+if numel(xu) < nperseg || numel(tu) ~= numel(xu)
+    t_frames = []; fpk_hz = []; return;
+end
+win = flattopwin(nperseg,'periodic');
+nfft = nperseg;
+k_min = ceil(f_min_hz * nfft / fs); k_min = max(2, k_min);
 
-    tu = tu(:); xu = xu(:);
-    if numel(xu) < nperseg || numel(tu) ~= numel(xu)
-        t_frames = []; fpk_hz = []; return;
+t_frames = []; fpk_hz = [];
+idx0 = 1;
+while (idx0 + nperseg - 1) <= numel(xu)
+    xw = xu(idx0:idx0+nperseg-1) .* win;
+    xw = xw - mean(xw,'omitnan');
+    X  = fft(xw, nfft);
+    half = floor(nfft/2) + 1;
+    P = abs(X(1:half)).^2;
+
+    if k_min > numel(P), idx0 = idx0 + hop; continue; end
+    [~, rel] = max(P(k_min:end));
+    k0 = k_min + rel - 1;
+
+    if harm_on
+        k0 = harmonic_guard_pick_subharmonic(P, k0, k_min, harm_max_order, harm_tol_bins, harm_ratio_min);
     end
 
-    win = make_window(nperseg, winName);
+    delta = parabolic_peak_interp_logP(P, k0);
+    f_est = (k0 - 1 + delta) * fs / nfft;
+    t_center = tu(idx0) + 0.5*(nperseg-1)/fs;
 
-    nfft = nperseg;
-    k_min = ceil(f_min_hz * nfft / fs);
-    k_min = max(2, k_min);
-
-    t_frames = [];
-    fpk_hz   = [];
-
-    idx0 = 1;
-    while (idx0 + nperseg - 1) <= numel(xu)
-        xw = xu(idx0:idx0+nperseg-1) .* win;
-        xw = xw - mean(xw,'omitnan');
-
-        X = fft(xw, nfft);
-        half = floor(nfft/2) + 1;
-        P = abs(X(1:half)).^2;
-
-        if k_min > numel(P)
-            idx0 = idx0 + hop; continue;
-        end
-
-        [~, rel] = max(P(k_min:end));
-        k0 = k_min + rel - 1;
-
-        if harm_on
-            k0 = harmonic_guard_pick_subharmonic(P, k0, k_min, harm_max_order, harm_tol_bins, harm_ratio_min);
-        end
-
-        delta = parabolic_peak_interp_logP(P, k0);
-        f_est = (k0 - 1 + delta) * fs / nfft;
-
-        t_center = tu(idx0) + 0.5*(nperseg-1)/fs;
-        t_frames(end+1,1) = t_center; %#ok<AGROW>
-        fpk_hz(end+1,1)   = f_est;    %#ok<AGROW>
-
-        idx0 = idx0 + hop;
-    end
+    t_frames(end+1,1) = t_center; %#ok<AGROW>
+    fpk_hz(end+1,1)   = f_est;    %#ok<AGROW>
+    idx0 = idx0 + hop;
+end
 end
 
 function k_pick = harmonic_guard_pick_subharmonic(P, k0, k_min, max_order, tol_bins, ratio_min)
-    k_pick = k0;
-    P0 = P(k0);
-    if ~isfinite(P0) || P0 <= 0
-        return;
+k_pick = k0;
+P0 = P(k0);
+if ~isfinite(P0) || P0 <= 0, return; end
+for m = 2:max_order
+    k_est = round(k0 / m);
+    if k_est < k_min, continue; end
+    lo = max(k_min, k_est - tol_bins);
+    hi = min(numel(P), k_est + tol_bins);
+    [Psub, idx] = max(P(lo:hi));
+    ksub = lo + idx - 1;
+    if isfinite(Psub) && (Psub >= ratio_min * P0)
+        k_pick = ksub;
+        P0 = Psub;
     end
-
-    for m = 2:max_order
-        k_est = round(k0 / m);
-        if k_est < k_min
-            continue;
-        end
-
-        lo = max(k_min, k_est - tol_bins);
-        hi = min(numel(P), k_est + tol_bins);
-
-        [Psub, idx] = max(P(lo:hi));
-        ksub = lo + idx - 1;
-
-        if isfinite(Psub) && (Psub >= ratio_min * P0)
-            k_pick = ksub;
-            P0 = Psub;
-        end
-    end
+end
 end
 
 function delta = parabolic_peak_interp_logP(P, k)
-    if k <= 1 || k >= numel(P), delta = 0; return; end
-    la = log(P(k-1) + 1e-20);
-    lb = log(P(k)   + 1e-20);
-    lc = log(P(k+1) + 1e-20);
-    denom = (la - 2*lb + lc);
-    if denom == 0 || ~isfinite(denom), delta = 0; return; end
-    delta = 0.5*(la - lc)/denom;
-    if ~isfinite(delta), delta = 0; end
-    delta = max(-0.75, min(0.75, delta));
+if k <= 1 || k >= numel(P), delta = 0; return; end
+la = log(P(k-1) + 1e-20);
+lb = log(P(k)   + 1e-20);
+lc = log(P(k+1) + 1e-20);
+den = (la - 2*lb + lc);
+if den == 0 || ~isfinite(den), delta = 0; return; end
+delta = 0.5*(la - lc)/den;
+if ~isfinite(delta), delta = 0; end
+delta = max(-0.75, min(0.75, delta));
 end
 
 function y_grid = smooth_in_time_to_grid(t_src, y_src, t_grid, dt_grid, smooth_sec)
-    y_i = interp_common(t_src, y_src, t_grid);
-    win_n = max(1, round(smooth_sec/dt_grid));
-    y_grid = movmean(y_i, win_n, 'omitnan');
+y_i = interp_common(t_src, y_src, t_grid);
+win_n = max(1, round(smooth_sec/dt_grid));
+y_grid = movmean(y_i, win_n, 'omitnan');
 end
 
 function out = interp_common(t_src, y_src, t_dst)
-    t_src = t_src(:); y_src = y_src(:); t_dst = t_dst(:);
-    ok = isfinite(t_src) & isfinite(y_src);
-    out = nan(size(t_dst));
-    if sum(ok) < 2, return; end
-    out = interp1(t_src(ok), y_src(ok), t_dst, 'linear', nan);
+t_src = t_src(:); y_src = y_src(:); t_dst = t_dst(:);
+ok = isfinite(t_src) & isfinite(y_src);
+out = nan(size(t_dst));
+if sum(ok) < 2, return; end
+out = interp1(t_src(ok), y_src(ok), t_dst, 'linear', nan);
 end
 
 function [MAE, RMSE, R, n] = metrics(yhat, yref)
-    m = isfinite(yhat) & isfinite(yref);
-    n = sum(m);
-    if n < 3
-        MAE = nan; RMSE = nan; R = nan; return;
-    end
-    e = yhat(m) - yref(m);
-    MAE  = mean(abs(e));
-    RMSE = sqrt(mean(e.^2));
-    R = corr(yhat(m), yref(m));
+m = isfinite(yhat) & isfinite(yref);
+n = sum(m);
+if n < 3, MAE = nan; RMSE = nan; R = nan; return; end
+e = yhat(m) - yref(m);
+MAE = mean(abs(e));
+RMSE = sqrt(mean(e.^2));
+R = corr(yhat(m), yref(m));
 end
 
 function [t_sec, HR] = read_txt_polar(p)
-    fid = fopen(p,'r');
-    if fid == -1, error('Não foi possível abrir o arquivo Polar.'); end
-    C = textscan(fid,'%s %f %*[^\n]','Delimiter',';','HeaderLines',1);
-    fclose(fid);
-    ts_str = C{1}; HR = C{2};
-
-    try
-        t_dt = datetime(ts_str,'InputFormat','yyyy-MM-dd''T''HH:mm:ss.SSS');
-    catch
-        t_dt = datetime(ts_str,'InputFormat','yyyy-MM-dd HH:mm:ss.SSS');
-    end
-    t_sec = seconds(t_dt - t_dt(1));
+fid = fopen(p,'r');
+if fid == -1, error('Não foi possível abrir o arquivo Polar.'); end
+C = textscan(fid,'%s %f %*[^\n]','Delimiter',';','HeaderLines',1);
+fclose(fid);
+ts_str = C{1};
+HR     = C{2};
+try
+    t_dt = datetime(ts_str,'InputFormat','yyyy-MM-dd''T''HH:mm:ss.SSS');
+catch
+    t_dt = datetime(ts_str,'InputFormat','yyyy-MM-dd HH:mm:ss.SSS');
 end
-
-% ====== FIX PRINCIPAL: make_window agora suporta o teu WINDOW_GRID ======
-function w = make_window(N, spec)
-    spec = lower(string(spec));
-    parts = split(spec, ":");
-    name = parts(1);
-
-    hasParam = numel(parts) > 1;
-    if hasParam
-        p = str2double(parts(2));
-        if ~isfinite(p), hasParam = false; end
-    end
-
-    switch name
-        case "rect"
-            w = rectwin(N);
-
-        case "hann"
-            w = hann(N,'periodic');
-
-        case "hamming"
-            w = hamming(N,'periodic');
-
-        case "blackman"
-            w = blackman(N,'periodic');
-
-        case "blackmanharris"
-            w = blackmanharris(N,'periodic');
-
-        case "flattop"
-            w = flattopwin(N,'periodic');
-
-        case "nuttall"
-            w = nuttallwin(N,'periodic');
-
-        case "bohmanwin"
-            w = bohmanwin(N);
-
-        case "bartlett"
-            w = bartlett(N);
-
-        case "triang"
-            w = triang(N);
-
-        case "parzenwin"
-            w = parzenwin(N);
-
-        case "kaiser"
-            if ~hasParam, p = 8; end
-            w = kaiser(N, p);
-
-        case "tukey"
-            if ~hasParam, p = 0.5; end
-            w = tukeywin(N, p);
-
-        case "cheb"
-            if ~hasParam, p = 80; end
-            w = chebwin(N, p);
-
-        case "gauss"
-            if ~hasParam, p = 3.5; end
-            w = gausswin(N, p);
-
-        otherwise
-            % fallback seguro
-            w = hann(N,'periodic');
-    end
-
-    w = w(:);
+t_sec = seconds(t_dt - t_dt(1));
 end

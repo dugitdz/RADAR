@@ -10,7 +10,7 @@ DATASETS = [ ...
 
 %% ===================== FIXOS =====================
 GAP_THR_SEC = 0.6;
-FS_TARGET   = 25.0;
+FS_TARGET   = 50.0;
 
 COL_T_MS   = 1;
 COL_HEART  = 2;
@@ -22,8 +22,8 @@ F_MIN_HZ       = 0.05;
 MIN_POINTS_AFTER_RESAMPLE = 32;
 MIN_METRIC_SAMPLES        = 10;
 
-CFG.N      = 32;
-CFG.hop    = 16;
+CFG.N      = 128;
+CFG.hop    = 64;
 CFG.WRAP   = 0;
 
 CFG.win    = "flattop";

@@ -8,18 +8,32 @@ import numpy as np
 import matplotlib.pyplot as plt
 from bleak import BleakScanner, BleakClient
 
+try:
+    from scipy.signal import cheby2, filtfilt
+    _HAVE_SCIPY = True
+except Exception:
+    _HAVE_SCIPY = False
+
 
 DEVICE_NAME = "ESP32C3_IC"
 CHAR_UUID   = "00001234-0000-1000-8000-00805f9b34fb"
 
 CFG = dict(
-    N=64,
-    hop=32,
+    N=32,
+    hop=16,
     f_min_hz=0.05,
     harm_on=1,
     harm_max=3,
     harm_tol=1,
     harm_ratio=0.20,
+)
+
+BP = dict(
+    on=1,
+    wi=0.80,
+    wf=2.00,
+    ford=4,
+    Rs=30.0,
 )
 
 GUI_REFRESH_HZ  = 10.0
@@ -117,6 +131,55 @@ def estimate_hr_window(x, fs, f_min_hz, harm_on, harm_max, harm_tol, harm_ratio)
     return 60.0 * f_est
 
 
+def _estimate_fs_from_t(tw):
+    tw = np.asarray(tw, dtype=float).reshape(-1)
+    if tw.size < 4:
+        return np.nan
+    dt = np.diff(tw)
+    ok = np.isfinite(dt) & (dt > 0)
+    if np.count_nonzero(ok) < max(3, tw.size // 4):
+        return np.nan
+    m = np.mean(dt[ok])
+    if not np.isfinite(m) or m <= 0:
+        return np.nan
+    return 1.0 / m
+
+
+def _try_filter_cheby2_filtfilt(x, fs, wi, wf, ford, Rs):
+    if (not _HAVE_SCIPY) or (not np.isfinite(fs)) or fs <= 0:
+        return None
+    if (not np.isfinite(wi)) or (not np.isfinite(wf)) or wi <= 0 or wf <= 0 or wf <= wi:
+        return None
+    nyq = 0.5 * fs
+    if not np.isfinite(nyq) or nyq <= 0:
+        return None
+    if wf >= nyq:
+        return None
+    wn = np.array([wi / nyq, wf / nyq], dtype=float)
+    if np.any(~np.isfinite(wn)) or np.any(wn <= 0) or np.any(wn >= 1) or wn[1] <= wn[0]:
+        return None
+    if (ford % 2) != 0 or ford < 2:
+        return None
+    n = int(ford // 2)
+    try:
+        b, a = cheby2(N=n, rs=float(Rs), Wn=wn, btype="bandpass", analog=False, output="ba")
+    except Exception:
+        return None
+    x = np.asarray(x, dtype=float).reshape(-1)
+    if x.size < 8:
+        return None
+    try:
+        padlen_default = 3 * (max(len(a), len(b)) - 1)
+        if x.size <= padlen_default:
+            return None
+        y = filtfilt(b, a, x)
+    except Exception:
+        return None
+    if y.shape != x.shape or np.any(~np.isfinite(y)):
+        return None
+    return y
+
+
 class State:
     def __init__(self):
         self.t0_ms = None
@@ -141,52 +204,66 @@ class State:
         self.lock = threading.Lock()
 
 
-def process_if_possible(st: State):
-    N, hop = CFG["N"], CFG["hop"]
+def process_if_possible(st: State, max_windows=2):
+    N, hop = int(CFG["N"]), int(CFG["hop"])
+    done = 0
 
-    with st.lock:
-        n = len(st.x)
-        if n < N:
+    while done < int(max_windows):
+        with st.lock:
+            n = len(st.x)
+            if n < N:
+                return
+            x_arr = np.asarray(st.x, dtype=float)
+            t_arr = np.asarray(st.t, dtype=float)
+
+        idx_end = n
+        idx_start = idx_end - N
+        if idx_start < 0:
             return
-        x_arr = np.asarray(st.x, dtype=float)
-        t_arr = np.asarray(st.t, dtype=float)
 
-    idx_end = n
-    idx_start = idx_end - N
-    if idx_start < 0:
-        return
+        tw = t_arr[idx_start:idx_end]
+        xw = x_arr[idx_start:idx_end]
 
-    tw = t_arr[idx_start:idx_end]
-    xw = x_arr[idx_start:idx_end]
+        fs = _estimate_fs_from_t(tw)
+        if not np.isfinite(fs) or fs <= 0:
+            return
 
-    dt = np.diff(tw)
-    ok = np.isfinite(dt) & (dt > 0)
-    if np.count_nonzero(ok) < max(3, N//4):
-        return
-    fs = 1.0 / np.mean(dt[ok])
+        t_center = float(tw[0] + 0.5 * (tw[-1] - tw[0]))
 
-    t_center = float(tw[0] + 0.5*(tw[-1] - tw[0]))
+        t0 = time.perf_counter()
 
-    t0 = time.perf_counter()
-    hr = estimate_hr_window(
-        xw, fs, CFG["f_min_hz"],
-        CFG["harm_on"], CFG["harm_max"], CFG["harm_tol"], CFG["harm_ratio"]
-    )
-    t1 = time.perf_counter()
-    dt_ms = 1000.0 * (t1 - t0)
+        x_use = xw
+        if BP.get("on", 1):
+            y = _try_filter_cheby2_filtfilt(
+                xw, fs, float(BP["wi"]), float(BP["wf"]), int(BP["ford"]), float(BP["Rs"])
+            )
+            if y is not None:
+                x_use = y
 
-    if not np.isfinite(hr):
-        return
+        hr = estimate_hr_window(
+            x_use, fs, CFG["f_min_hz"],
+            CFG["harm_on"], CFG["harm_max"], CFG["harm_tol"], CFG["harm_ratio"]
+        )
 
-    with st.lock:
-        st.hr_t.append(t_center); st.hr.append(float(hr))
-        st.fs_t.append(t_center); st.fs.append(float(fs))
-        st.fft_t.append(t_center); st.fft_ms.append(float(dt_ms))
+        t1 = time.perf_counter()
+        dt_ms = 1000.0 * (t1 - t0)
 
-        for _ in range(hop):
-            if st.x:
-                st.x.popleft()
-                st.t.popleft()
+        if np.isfinite(hr):
+            with st.lock:
+                st.hr_t.append(t_center); st.hr.append(float(hr))
+                st.fs_t.append(t_center); st.fs.append(float(fs))
+                st.fft_t.append(t_center); st.fft_ms.append(float(dt_ms))
+
+                for _ in range(hop):
+                    if st.x:
+                        st.x.popleft()
+                        st.t.popleft()
+            done += 1
+        else:
+            with st.lock:
+                st.fs_t.append(t_center); st.fs.append(float(fs))
+                st.fft_t.append(t_center); st.fft_ms.append(float(dt_ms))
+            return
 
 
 def make_gui():
@@ -194,24 +271,27 @@ def make_gui():
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 7), sharex=True)
 
     l_hr, = ax1.plot([], [], lw=1.5)
+    p_hr, = ax1.plot([], [], linestyle="none", marker="o", markersize=4)
     ax1.set_ylabel("HR (bpm)")
     ax1.grid(True)
 
     l_fs, = ax2.plot([], [], lw=1.0)
+    p_fs, = ax2.plot([], [], linestyle="none", marker="o", markersize=4)
     ax2.set_ylabel("Fs_win (Hz)")
     ax2.grid(True)
 
     l_fft, = ax3.plot([], [], lw=1.0)
-    ax3.set_ylabel("FFT time (ms)")
+    p_fft, = ax3.plot([], [], linestyle="none", marker="o", markersize=4)
+    ax3.set_ylabel("Proc (ms)")
     ax3.set_xlabel("t (s)")
     ax3.grid(True)
 
     fig.tight_layout()
-    return fig, (ax1, ax2, ax3), (l_hr, l_fs, l_fft)
+    return fig, (ax1, ax2, ax3), (l_hr, p_hr, l_fs, p_fs, l_fft, p_fft)
 
 
 def gui_loop(st: State):
-    fig, (ax1, ax2, ax3), (l_hr, l_fs, l_fft) = make_gui()
+    fig, (ax1, ax2, ax3), (l_hr, p_hr, l_fs, p_fs, l_fft, p_fft) = make_gui()
     period = 1.0 / GUI_REFRESH_HZ
 
     while plt.fignum_exists(fig.number):
@@ -229,25 +309,46 @@ def gui_loop(st: State):
 
         if t_hr.size > 0:
             l_hr.set_data(t_hr, y_hr)
+            p_hr.set_data(t_hr, y_hr)
             ax1.relim(); ax1.autoscale_view()
 
         if t_fs.size > 0:
             l_fs.set_data(t_fs, y_fs)
+            p_fs.set_data(t_fs, y_fs)
             ax2.relim(); ax2.autoscale_view()
 
         if t_ft.size > 0:
             l_fft.set_data(t_ft, y_ft)
+            p_fft.set_data(t_ft, y_ft)
             ax3.relim(); ax3.autoscale_view()
 
-        ax1.set_title(f"good={good} bad={bad} ts_back={back} | N={CFG['N']} hop={CFG['hop']}")
+        ax1.set_title(
+            f"good={good} bad={bad} ts_back={back} | N={CFG['N']} hop={CFG['hop']} | "
+            f"BP={'ON' if BP.get('on',1) else 'OFF'} {BP['wi']:.2f}-{BP['wf']:.2f}Hz"
+        )
 
         fig.canvas.draw()
         fig.canvas.flush_events()
         time.sleep(period)
 
 
+def proc_loop(st: State):
+    while True:
+        try:
+            process_if_possible(st, max_windows=2)
+        except Exception:
+            pass
+        time.sleep(0.005)
+
+
 async def main():
     st = State()
+
+    gui_thread = threading.Thread(target=gui_loop, args=(st,), daemon=True)
+    gui_thread.start()
+
+    proc_thread = threading.Thread(target=proc_loop, args=(st,), daemon=True)
+    proc_thread.start()
 
     print("Scanning BLE...")
     devices = await BleakScanner.discover(timeout=5.0)
@@ -264,17 +365,16 @@ async def main():
             print(" ", d.address, d.name)
         return
 
-    gui_thread = threading.Thread(target=gui_loop, args=(st,), daemon=True)
-    gui_thread.start()
-
     def on_notify(sender: int, data: bytearray):
-        nonlocal st
-
         rec, err = parse_pkt_19(data)
         if rec is None:
             st.bad += 1
             if st.bad % 20 == 0:
-                print(f"[BAD] {err} hex={data.hex()}")
+                try:
+                    hx = data.hex()
+                except Exception:
+                    hx = "<nohex>"
+                print(f"[BAD] {err} hex={hx}")
             return
 
         t_ms, total, breath, heart = rec
@@ -296,8 +396,6 @@ async def main():
 
         if good % DEBUG_EVERY_N == 0:
             print(f"[OK] t_ms={t_ms:9.2f} t={t_sec:8.3f}s | total={total:+.3f} breath={breath:+.3f} heart={heart:+.3f}")
-
-        process_if_possible(st)
 
     print("Conectando em:", target.address, target.name)
     async with BleakClient(target.address) as client:
