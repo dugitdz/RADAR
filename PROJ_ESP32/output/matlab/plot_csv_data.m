@@ -1,31 +1,46 @@
 clc; clear; close all;
+
 %% ===================== PARÂMETROS CONFIGURÁVEIS ===================== %%
-N        = 16;
+N        = 128;
 overlap  = 0.8;
 hop      = max(1, round(N*(1-overlap)));
+
 win_smooth_raw   = 128;
 win_smooth_final = 128;
-f_low  = 0.8;
-f_high = 3.0;
 
-% === PARÂMETROS DE TRACKING ===
-bpm_change_limit = 10;  % Mudança máxima esperada entre janelas
-penalty_factor   = 2.5; % Penalidade para saltos bruscos
+% ====== CORTES DO PASSA-FAIXA (AJUSTE AQUI) ======
+% HEART em bpm:
+heart_bp_bpm = [50 150];   % <<<<--- pedido: 60;150
+
+% BREATH em brpm (sugestão default):
+breath_bp_brpm = [6 30];   % ajuste como quiser
+
+% filtro
+bp_order_h  = 2;           % ordem Butterworth (heart)
+bp_order_br = 4;           % ordem Butterworth (breath)
+min_f_hz    = 0.05;        % evita encostar em 0 Hz
+guard_hz    = 0.05;        % margem p/ não encostar em Nyquist
+
+%% ===================== PATHS ===================== %%
+PHASES_PATH    = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\phases.csv';
+polar_HR_path  = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\POLARH2.txt';
 
 %% ========================== LEITURA ========================== %%
-data  = readmatrix('C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\phase.csv');
+data   = readmatrix(PHASES_PATH);
 tpuro  = data(:,1);
+breath = data(:,3);
 heart  = data(:,4);
 
 %% ====== TEMPO ======
 t  = (tpuro - tpuro(1)) / 1000;
 dt = mean(diff(t));
-srate = 1/dt;
+srate = 1/dt; %#ok<NASGU>
 nt = numel(t);
 
 %% ====== SEGMENTAÇÃO POR BURACOS ======
 dt_all   = diff(t);
 break_ix = find(dt_all > 0.5);
+
 if isempty(break_ix)
     seg_starts = 1;
     seg_ends   = nt;
@@ -35,162 +50,395 @@ else
 end
 nSeg = numel(seg_starts);
 
-%% ====== FREX PELO ESPECTRO DO HEART (ORIGINAL) ======
-Nfft = 2*nt - 1;
-f_fft = linspace(0, srate, Nfft);
-H = fft(heart, Nfft);
-[~, imax] = max(abs(H));
-frex = f_fft(imax);
+%% ===================== FILTRO PASSA-FAIXA FIXO (HEART) POR SEGMENTO ===================== %%
+convs_h = nan(nt,1);
 
-%% ====== DEFINIR h = X / frex (ORIGINAL) ======
-X = 0.6;               
-h = X / frex;
-h = max(h, 0.1);
-h = min(h, 5.0);
+% cortes em Hz
+heart_bp_hz = heart_bp_bpm / 60;
 
-%% ========================== WAVELET & CONVOLUÇÃO (ORIGINAL) ========================== %%
-idx   = (1:nt) - ceil(nt/2);
-t_aux = idx(:) * dt;
-gaus = exp((-4*log(2)*t_aux.^2)/h^2) .* exp(1i*2*pi*frex*t_aux);
-nGaus  = length(gaus);
-nConv  = nGaus + nt - 1;
-heartX = fft(heart, nConv);
-gausX  = fft(gaus,  nConv);
-gausX  = gausX ./ max(gausX);
-convX     = heartX .* gausX;
-convs_all = ifft(convX);
-startIdx = floor(nGaus/2) + 1;
-endIdx   = startIdx + nt - 1;
-convs    = convs_all(startIdx:endIdx);
+for s = 1:nSeg
+    idx_seg = seg_starts(s):seg_ends(s);
+    t_seg   = t(idx_seg);
+    x_seg   = heart(idx_seg);
 
-%% ====== FFT POR JANELAS COM TRACKING ======
+    if numel(idx_seg) < 8
+        continue;
+    end
+
+    dt_seg = diff(t_seg);
+    if any(dt_seg <= 0), continue; end
+    fs_seg = 1/mean(dt_seg);
+
+    f1 = max(min_f_hz, heart_bp_hz(1));
+    f2 = min((fs_seg/2) - guard_hz, heart_bp_hz(2));
+
+    if ~(isfinite(f1) && isfinite(f2) && f2 > f1)
+        continue;
+    end
+
+    x_seg = x_seg - mean(x_seg);
+
+    Wn = [f1 f2] / (fs_seg/2);
+    if any(Wn <= 0) || any(Wn >= 1)
+        continue;
+    end
+
+    [b,a] = butter(bp_order_h, Wn, 'bandpass');
+
+    try
+        y_seg = filtfilt(b,a,x_seg);
+    catch
+        continue;
+    end
+
+    convs_h(idx_seg) = y_seg;
+end
+
+%% ===================== FILTRO PASSA-FAIXA FIXO (BREATH) POR SEGMENTO ===================== %%
+convs_br = nan(nt,1);
+
+breath_bp_hz = breath_bp_brpm / 60;
+
+for s = 1:nSeg
+    idx_seg = seg_starts(s):seg_ends(s);
+    t_seg   = t(idx_seg);
+    x_seg   = breath(idx_seg);
+
+    if numel(idx_seg) < 8
+        continue;
+    end
+
+    dt_seg = diff(t_seg);
+    if any(dt_seg <= 0), continue; end
+    fs_seg = 1/mean(dt_seg);
+
+    f1 = max(min_f_hz, breath_bp_hz(1));
+    f2 = min((fs_seg/2) - guard_hz, breath_bp_hz(2));
+
+    if ~(isfinite(f1) && isfinite(f2) && f2 > f1)
+        continue;
+    end
+
+    x_seg = x_seg - mean(x_seg);
+
+    Wn = [f1 f2] / (fs_seg/2);
+    if any(Wn <= 0) || any(Wn >= 1)
+        continue;
+    end
+
+    [b,a] = butter(bp_order_br, Wn, 'bandpass');
+
+    try
+        y_seg = filtfilt(b,a,x_seg);
+    catch
+        continue;
+    end
+
+    convs_br(idx_seg) = y_seg;
+end
+
+%% ===================== FFT POR JANELAS (HEART, SEGMENTADO) ===================== %%
 halfN   = N/2;
 rel_idx = -halfN : (halfN-1);
 
-t_window      = [];
+freq_weighted_sum_h = zeros(nt,1);
+weight_sum_h        = zeros(nt,1);
+
+t_window_h    = [];
 freq_h_window = [];
-k = 0;
+k_h = 0;
 
 for s = 1:nSeg
     seg_start = seg_starts(s);
     seg_end   = seg_ends(s);
+
     center_list = seg_start : hop : seg_end;
-    
-    last_valid_bpm = NaN; % Reset do tracking por segmento
 
     for center_theoretical = center_list
         idx_theo = center_theoretical + rel_idx;
         idx_win  = idx_theo(idx_theo >= seg_start & idx_theo <= seg_end);
-        
-        if numel(idx_win) < 4, continue; end
-        
+
+        if numel(idx_win) < 4
+            continue;
+        end
+
         t_seg = t(idx_win);
-        x_seg = real(convs(idx_win));
+        x_seg = convs_h(idx_win);
+
+        if any(isnan(x_seg)), continue; end
+
         dt_seg = diff(t_seg);
         if any(dt_seg <= 0), continue; end
         fs_seg = 1/mean(dt_seg);
+
         x_seg = x_seg - mean(x_seg);
-        
-        % --- APLICAÇÃO DE TAPER (HANNING) CORRIGIDA ---
-        win_taper = hanning(numel(x_seg));
-        x_seg_tapered = x_seg(:) .* win_taper; % (:) garante vetor coluna
-        
-        Xw   = fft(x_seg_tapered);
-        Lwin = numel(x_seg_tapered);
+
+        Xw   = fft(x_seg);
+        Lwin = numel(x_seg);
         half = floor(Lwin/2);
+        if half < 3, continue; end
+
         f_ax = (0:half-1) * fs_seg / Lwin;
-        
         magX = abs(Xw(1:half));
-        mask = (f_ax >= f_low) & (f_ax <= f_high);
-        
-        if ~any(mask), continue; end
-        
-        % Candidatos
-        f_cands = f_ax(mask);
-        m_cands = magX(mask);
-        bpm_cands = f_cands * 60;
-        
-        % --- LÓGICA DE TRACKING ---
-        if isnan(last_valid_bpm)
-            % Sem memória: Pega o pico mais forte
-            [~, imax_win] = max(m_cands);
-            if length(imax_win) > 1, imax_win = imax_win(1); end
-            bpm_chosen = bpm_cands(imax_win);
-        else
-            % Com memória: Score Ponderado
-            dist_bpm = abs(bpm_cands - last_valid_bpm);
-            weights  = 1 ./ (1 + penalty_factor * (dist_bpm / bpm_change_limit).^2);
-            score    = m_cands .* weights;
-            
-            [~, best_idx] = max(score);
-            if length(best_idx) > 1, best_idx = best_idx(1); end
-            bpm_chosen = bpm_cands(best_idx);
+
+        % pico dominante (ignora DC)
+        [~, imax_win] = max(magX(2:end));
+        imax_win = imax_win + 1;
+        f_est_h  = f_ax(imax_win);
+
+        bpm_h = f_est_h * 60;
+
+        k_h = k_h + 1;
+        t_window_h(k_h,1)    = mean(t_seg);
+        freq_h_window(k_h,1) = bpm_h;
+
+        for ii = idx_win
+            dist = abs(ii - center_theoretical);
+            w    = (halfN + 1) - dist;
+            if w < 0, w = 0; end
+
+            freq_weighted_sum_h(ii) = freq_weighted_sum_h(ii) + bpm_h * w;
+            weight_sum_h(ii)        = weight_sum_h(ii)        + w;
         end
-        
-        last_valid_bpm = bpm_chosen;
-        
-        k = k + 1;
-        t_window(k,1)      = mean(t_seg);
-        freq_h_window(k,1) = bpm_chosen;
     end
 end
 
-%% ====== 1) INTERPOLAÇÃO ======
+%% ====== 1) FREQ_H POR AMOSTRA ======
 freq_h_raw = nan(nt,1);
-idx_good_win = ~isnan(freq_h_window);
+valid_h = weight_sum_h > 0;
+freq_h_raw(valid_h) = freq_weighted_sum_h(valid_h) ./ weight_sum_h(valid_h);
 
-if any(idx_good_win)
-    freq_h_raw = interp1(t_window(idx_good_win), freq_h_window(idx_good_win), ...
-                         t, 'pchip', nan); 
-end
-
-%% ====== 2) SUAVIZAÇÃO POR SEGMENTO ======
+%% ====== 2) SUAVIZAÇÃO H POR SEGMENTO ======
 freq_h_smooth = nan(nt,1);
 for s = 1:nSeg
     idx_seg = seg_starts(s):seg_ends(s);
     freq_h_smooth(idx_seg) = movmean(freq_h_raw(idx_seg), win_smooth_raw, 'omitnan');
 end
 
-%% ====== 3) PREENCHIMENTO DE GAPS ======
-idx_good = ~isnan(freq_h_smooth);
-if any(idx_good)
-    t_targets = t(~idx_good);
-    freq_h_smooth(find(~idx_good)) = interp1(t(idx_good), freq_h_smooth(idx_good), ...
-                                             t_targets, 'linear', 'extrap');
+%% ====== 3) INTERPOLAÇÃO H PARA FECHAR BURACOS ======
+idx_good_h = ~isnan(freq_h_smooth);
+if any(idx_good_h)
+    freq_h_smooth(~idx_good_h) = interp1(t(idx_good_h), freq_h_smooth(idx_good_h), ...
+                                         t(~idx_good_h),'linear','extrap');
 end
 
-%% ====== 4) SUAVIZAÇÃO FINAL ======
+%% ====== 4) SUAVIZAÇÃO FINAL H ======
 freq_h_final = nan(nt,1);
 for s = 1:nSeg
     idx_seg = seg_starts(s):seg_ends(s);
     freq_h_final(idx_seg) = movmean(freq_h_smooth(idx_seg), win_smooth_final, 'omitnan');
 end
 
-%% ====== GRÁFICO FINAL ======
+%% ===================== FFT POR JANELAS (BREATH, SEGMENTADO) ===================== %%
+freq_weighted_sum_br = zeros(nt,1);
+weight_sum_br        = zeros(nt,1);
+
+t_window_br    = [];
+freq_br_window = [];
+k_br = 0;
+
+for s = 1:nSeg
+    seg_start = seg_starts(s);
+    seg_end   = seg_ends(s);
+
+    center_list = seg_start : hop : seg_end;
+
+    for center_theoretical = center_list
+        idx_theo = center_theoretical + rel_idx;
+        idx_win  = idx_theo(idx_theo >= seg_start & idx_theo <= seg_end);
+
+        if numel(idx_win) < 4
+            continue;
+        end
+
+        t_seg = t(idx_win);
+        x_seg = convs_br(idx_win);
+
+        if any(isnan(x_seg)), continue; end
+
+        dt_seg = diff(t_seg);
+        if any(dt_seg <= 0), continue; end
+        fs_seg = 1/mean(dt_seg);
+
+        x_seg = x_seg - mean(x_seg);
+
+        Xw   = fft(x_seg);
+        Lwin = numel(x_seg);
+        half = floor(Lwin/2);
+        if half < 3, continue; end
+
+        f_ax = (0:half-1) * fs_seg / Lwin;
+        magX = abs(Xw(1:half));
+
+        [~, imax_win_br] = max(magX(2:end));
+        imax_win_br = imax_win_br + 1;
+        f_est_br    = f_ax(imax_win_br);
+
+        bpm_br = f_est_br * 60;
+
+        k_br = k_br + 1;
+        t_window_br(k_br,1)    = mean(t_seg);
+        freq_br_window(k_br,1) = bpm_br;
+
+        for ii = idx_win
+            dist = abs(ii - center_theoretical);
+            w    = (halfN + 1) - dist;
+            if w < 0, w = 0; end
+
+            freq_weighted_sum_br(ii) = freq_weighted_sum_br(ii) + bpm_br * w;
+            weight_sum_br(ii)        = weight_sum_br(ii)        + w;
+        end
+    end
+end
+
+%% ====== 1) FREQ_BR POR AMOSTRA ======
+freq_br_raw = nan(nt,1);
+valid_br = weight_sum_br > 0;
+freq_br_raw(valid_br) = freq_weighted_sum_br(valid_br) ./ weight_sum_br(valid_br);
+
+%% ====== 2) SUAVIZAÇÃO BR POR SEGMENTO ======
+freq_br_smooth = nan(nt,1);
+for s = 1:nSeg
+    idx_seg = seg_starts(s):seg_ends(s);
+    freq_br_smooth(idx_seg) = movmean(freq_br_raw(idx_seg), win_smooth_raw, 'omitnan');
+end
+
+%% ====== 3) INTERPOLAÇÃO BR PARA FECHAR BURACOS ======
+idx_good_br = ~isnan(freq_br_smooth);
+if any(idx_good_br)
+    freq_br_smooth(~idx_good_br) = interp1(t(idx_good_br), freq_br_smooth(idx_good_br), ...
+                                           t(~idx_good_br),'linear','extrap');
+end
+
+%% ====== 4) SUAVIZAÇÃO FINAL BR ======
+freq_br_final = nan(nt,1);
+for s = 1:nSeg
+    idx_seg = seg_starts(s):seg_ends(s);
+    freq_br_final(idx_seg) = movmean(freq_br_smooth(idx_seg), win_smooth_final, 'omitnan');
+end
+
+%% ===================== POLAR: LEITURA (DO SEU JEITO) + ERROS ===================== %%
+[t_polar, HR_polar] = read_txt_polar(polar_HR_path);
+
+[t_polar, ia] = unique(t_polar, 'stable');
+HR_polar = HR_polar(ia);
+
+HR_polar_mean = mean(HR_polar(isfinite(HR_polar)));
+f_polar_mean  = HR_polar_mean / 60; %#ok<NASGU>
+
+% alinha (t_polar começa em 0) com eixo do radar (t também começa em 0)
+t_polar_aligned = t_polar + t(1);
+
+% recorta ao intervalo do radar
+in = isfinite(t_polar_aligned) & isfinite(HR_polar) & ...
+     (t_polar_aligned >= t(1)) & (t_polar_aligned <= t(end));
+
+t_polar_aligned = t_polar_aligned(in);
+HR_polar_in     = HR_polar(in);
+
+% interpola radar nos tempos da Polar (AQUI NASCEM AS VARIÁVEIS)
+HR_raw_at_polar   = interp1(t, freq_h_raw,   t_polar_aligned, 'linear', 'extrap');
+HR_final_at_polar = interp1(t, freq_h_final, t_polar_aligned, 'linear', 'extrap');
+
+% erros
+err_raw   = HR_raw_at_polar   - HR_polar_in;
+err_final = HR_final_at_polar - HR_polar_in;
+
+% métricas compatíveis (sem omitnan)
+v_raw = isfinite(err_raw)   & isfinite(HR_raw_at_polar)   & isfinite(HR_polar_in);
+v_fin = isfinite(err_final) & isfinite(HR_final_at_polar) & isfinite(HR_polar_in);
+
+metrics = struct();
+
+if any(v_raw)
+    e  = err_raw(v_raw);
+    gt = HR_polar_in(v_raw);
+    pr = HR_raw_at_polar(v_raw);
+
+    metrics.raw.MAE  = mean(abs(e));
+    metrics.raw.RMSE = sqrt(mean(e.^2));
+    metrics.raw.BIAS = mean(e);
+    metrics.raw.MAPE = mean(abs(e)./max(gt,1e-6))*100;
+    metrics.raw.CORR = corr(pr(:), gt(:));
+else
+    metrics.raw.MAE  = NaN; metrics.raw.RMSE = NaN; metrics.raw.BIAS = NaN;
+    metrics.raw.MAPE = NaN; metrics.raw.CORR = NaN;
+end
+
+if any(v_fin)
+    e  = err_final(v_fin);
+    gt = HR_polar_in(v_fin);
+    pr = HR_final_at_polar(v_fin);
+
+    metrics.final.MAE  = mean(abs(e));
+    metrics.final.RMSE = sqrt(mean(e.^2));
+    metrics.final.BIAS = mean(e);
+    metrics.final.MAPE = mean(abs(e)./max(gt,1e-6))*100;
+    metrics.final.CORR = corr(pr(:), gt(:));
+else
+    metrics.final.MAE  = NaN; metrics.final.RMSE = NaN; metrics.final.BIAS = NaN;
+    metrics.final.MAPE = NaN; metrics.final.CORR = NaN;
+end
+
+fprintf('\n=== ERROS vs POLAR (HR) ===\n');
+fprintf('RAW  : MAE=%.3f bpm | RMSE=%.3f bpm | BIAS=%.3f bpm | MAPE=%.2f%% | CORR=%.3f\n', ...
+    metrics.raw.MAE, metrics.raw.RMSE, metrics.raw.BIAS, metrics.raw.MAPE, metrics.raw.CORR);
+fprintf('FINAL: MAE=%.3f bpm | RMSE=%.3f bpm | BIAS=%.3f bpm | MAPE=%.2f%% | CORR=%.3f\n\n', ...
+    metrics.final.MAE, metrics.final.RMSE, metrics.final.BIAS, metrics.final.MAPE, metrics.final.CORR);
+
+%% ===================== PLOTS POLAR x RADAR + ERRO ===================== %%
 figure;
-plot(t_window, freq_h_window, 'o', 'Color', [0.7 0.7 0.7]); hold on;
-plot(t, freq_h_raw, 'b.', 'MarkerSize', 4);
+plot(t_polar_aligned, HR_polar_in, 'k', 'LineWidth', 1.5); hold on;
+plot(t_polar_aligned, HR_raw_at_polar, '.');
+plot(t_polar_aligned, HR_final_at_polar, 'LineWidth', 1.2);
+xlabel('Tempo (s)'); ylabel('HR (bpm)');
+title('Comparação HR: Polar vs Radar (raw/final)');
+grid on; legend('Polar','Radar@Polar (raw)','Radar@Polar (final)');
+
+figure;
+plot(t_polar_aligned, err_raw, '.'); hold on;
+plot(t_polar_aligned, err_final, 'LineWidth', 1.2);
+yline(0,'--');
+xlabel('Tempo (s)'); ylabel('Erro (bpm)');
+title('Erro HR (Radar - Polar)');
+grid on; legend('Erro raw','Erro final','0');
+
+%% ====== GRÁFICOS (SEUS) ======
+figure;
+plot(t_window_h, freq_h_window, 'o'); hold on;
+plot(t, freq_h_raw, '.');
 plot(t, freq_h_final, 'k', 'LineWidth', 1.5);
 xlabel('Tempo (s)');
 ylabel('HR (bpm)');
-title(sprintf('HR Final — Wavelet + Tracking (h=%.3f)', h));
+title(sprintf('HEART | Bandpass %g-%g bpm | ordem %d', heart_bp_bpm(1), heart_bp_bpm(2), bp_order_h));
 grid on;
-legend('Tracking','Raw','Final');
+legend('Janela','Raw','Final');
 
-%% ====== SALVAR RESULTADO ======
-freq_h       = freq_h_raw;
-freq_h_cont  = freq_h_final;
-mean_h_cont  = freq_h_final;
-freq_br      = nan(size(t));
-freq_br_cont = freq_br;
-mean_br_cont = freq_br;
+figure;
+plot(t_window_br, freq_br_window, 'o'); hold on;
+plot(t, freq_br_raw, '.');
+plot(t, freq_br_final, 'k', 'LineWidth', 1.5);
+xlabel('Tempo (s)');
+ylabel('RR (brpm)');
+title(sprintf('BREATH | Bandpass %g-%g brpm | ordem %d', breath_bp_brpm(1), breath_bp_brpm(2), bp_order_br));
+grid on;
+legend('Janela','Raw','Final');
 
-save('freq_results.mat', 't', ...
-    'freq_h_raw','freq_h', ...
-    'freq_h_cont','mean_h_cont', ...
-    'freq_br','freq_br_cont','mean_br_cont', ...
-    't_window','freq_h_window', ...
-    'seg_starts','seg_ends', ...
-    'N','overlap','hop', ...
-    'win_smooth_raw','win_smooth_final', ...
-    'frex','h','X');
+%% ===================== FUNÇÃO LOCAL (POLAR) ===================== %%
+function [t_sec, HR] = read_txt_polar(p)
+    fid = fopen(p,'r');
+    if fid == -1, error('Não foi possível abrir o arquivo Polar.'); end
+    C = textscan(fid,'%s %f %*[^\n]','Delimiter',';','HeaderLines',1);
+    fclose(fid);
+
+    ts_str = C{1};
+    HR     = C{2};
+
+    try
+        t_dt = datetime(ts_str,'InputFormat','yyyy-MM-dd''T''HH:mm:ss.SSS');
+    catch
+        t_dt = datetime(ts_str,'InputFormat','yyyy-MM-dd HH:mm:ss.SSS');
+    end
+
+    t_sec = seconds(t_dt - t_dt(1));
+end

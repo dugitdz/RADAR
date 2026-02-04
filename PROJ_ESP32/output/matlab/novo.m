@@ -1,334 +1,513 @@
 clc; clear; close all;
 
-%% ===================== PARÂMETROS GERAIS ===================== %%
+%% ===================== PATHS =====================
+CSV_PATH       = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\phases.csv';
+POLAR_HR_PATH  = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\POLARH2.txt';
 
-% banda fisiológica do coração (para FFT / detecção de pico nas janelas)
-f_low  = 0.8;   % Hz
-f_high = 3.0;   % Hz
+COL_T_MS  = 1;
+COL_HEART = 2;
 
-% X fixo -> h = X / frex
-X = 0.6;
+gap_thr = 0.5;   % buraco (s)
 
-% caminhos base
-base_path = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\';
+%% ===================== FIXOS (fora do grid) =====================
+FIX.FILL_NAN_WITHIN_SEG = false;
 
-% ==================== 3 DUPLAS (PHASE x POLAR) ==================== %
-pairs = {
-    struct('phase',  'phase.csv',      'polar', 'POLARH10.txt' );
-    struct('phase',  'phases.csv',     'polar', 'POLARH2.txt'  );
-    struct('phase',  'phases_raw.csv', 'polar', 'POLARH3.txt'  );
-};
+% suavização (movmean) -> FIXO (fora do grid, como você pediu)
+FIX.MEAN_SMOOTH_SEC = 128.0;
 
-nPairs = numel(pairs);
+% comparação Polar -> FIXO (fora do grid, como você pediu)
+FIX.DO_POLAR_COMPARE = true;
+FIX.DT_GRID          = 0.1;
+FIX.IGNORE_START_SEC = 0;
 
-% ==================== GRID DE PARÂMETROS ==================== %
-N_list         = 8:8:256;        % tamanho da janela FFT
-overlap_list   = 0.5:0.05:0.95;   % sobreposição
-win_raw_list   = 32:32:128;        % janelas de movmean (sinal bruto)
-win_final_list = 32:32:128;        % janelas de movmean (sinal final)
+% plot final do melhor (opcional)
+FIX.PLOT_BEST = true;
 
-% normalização do RMSE pra ficar na mesma ordem de (1 - corr)
-rmse_scale = 10;   % bpm
+%% ===================== GRID (tudo que varia) =====================
+% CWT
+GRID.WAVELET        = {'bpum','amor','morse'};   % tenta nessa ordem
+GRID.VOICES_PER_OCT = [16];
 
-best_score_global = Inf;
-best_cfg = struct('N',[],'overlap',[],'win_raw',[],'win_final',[], ...
-                  'rmse_pairs',[],'corr_pairs',[]);
+% filtro (NOVO)
+GRID.BP_ORDER = [2 6];
+GRID.BP_WI    = [0.5 0.7];
+GRID.BP_WF    = [2.5 3.5];
 
-%% ==================== LOOP DO GRID ==================== %%
+% ridge contínuo (Hz)
+GRID.RIDGE_LAMBDA_HZ2 = [250];
 
-for iN = 1:length(N_list)
-    N = N_list(iN);
+% harmônico
+GRID.HARM_RATIO = [0.75 0.85 0.95];
 
-    for io = 1:length(overlap_list)
-        overlap = overlap_list(io);
+% suavização robusta (mediana)
+GRID.MEDIAN_SMOOTH_SEC = [0 2 5];
 
-        for iwr = 1:length(win_raw_list)
-            win_smooth_raw = win_raw_list(iwr);
+PRINT_EVERY = 20;
 
-            for iwf = 1:length(win_final_list)
-                win_smooth_final = win_final_list(iwf);
+%% ===================== CHECAGENS =====================
+if ~isfile(CSV_PATH),  error('CSV não encontrado: %s', CSV_PATH); end
+if ~isfile(POLAR_HR_PATH)
+    warning('Polar não encontrado: %s (métricas ficarão NaN)', POLAR_HR_PATH);
+end
 
-                rmse_list  = nan(1,nPairs);
-                corr_list  = nan(1,nPairs);
-                score_list = nan(1,nPairs);
+%% ===================== ENUMERA GRID =====================
+[A,B,C,D,E,F,G] = ndgrid( ...
+    1:numel(GRID.WAVELET), ...
+    GRID.VOICES_PER_OCT, ...
+    GRID.BP_ORDER, ...
+    GRID.BP_WI, ...
+    GRID.BP_WF, ...
+    GRID.RIDGE_LAMBDA_HZ2, ...
+    GRID.HARM_RATIO);
 
-                fprintf('---- Testando N=%3d | over=%.2f | win_raw=%3d | win_final=%3d ----\n', ...
-                        N, overlap, win_smooth_raw, win_smooth_final);
+% MEDIAN_SMOOTH_SEC entra como outro eixo (pra não explodir ndgrid acima)
+MEDV = GRID.MEDIAN_SMOOTH_SEC(:);
+comb0 = [A(:) B(:) C(:) D(:) E(:) F(:) G(:)];
+n0 = size(comb0,1);
+nComb = n0 * numel(MEDV);
 
-                for p = 1:nPairs
-                    phase_path = fullfile(base_path, pairs{p}.phase);
-                    polar_path = fullfile(base_path, pairs{p}.polar);
+fprintf('Total de combinações do grid: %d\n', nComb);
 
-                    [rmse_p, corr_p] = compute_error_for_pair( ...
-                        phase_path, polar_path, X, ...
-                        N, overlap, win_smooth_raw, win_smooth_final, ...
-                        f_low, f_high);
+%% ===================== PREALOC RESULTADOS =====================
+res = struct();
+res.wavelet_id   = zeros(nComb,1);
+res.vpo          = zeros(nComb,1);
+res.bp_order     = zeros(nComb,1);
+res.bp_wi        = zeros(nComb,1);
+res.bp_wf        = zeros(nComb,1);
+res.lambda_hz2   = zeros(nComb,1);
+res.harm_ratio   = zeros(nComb,1);
+res.med_sec      = zeros(nComb,1);
 
-                    rmse_list(p) = rmse_p;
-                    corr_list(p) = corr_p;
+res.MAE  = nan(nComb,1);
+res.RMSE = nan(nComb,1);
+res.CORR = nan(nComb,1);
 
-                    fprintf('   Par %d: RMSE = %.4f | Corr = %.4f\n', ...
-                            p, rmse_p, corr_p);
+%% ===================== PARALELISMO + PROGRESSO =====================
+useParallel = false;
+try
+    useParallel = license('test','Distrib_Computing_Toolbox') && exist('parpool','file')==2;
+catch
+    useParallel = false;
+end
 
-                    if isnan(rmse_p) || isnan(corr_p)
-                        score_list(p) = NaN;
-                    else
-                        rmse_norm = rmse_p / rmse_scale;
-                        % SCORE balanceado: RMSE_norm + (1 - corr)
-                        score_list(p) = rmse_norm + (1 - corr_p);
-                    end
-                end
+dq = [];
+useDQ = false;
+if useParallel
+    try
+        p = gcp('nocreate');
+        if isempty(p), parpool; end
+        dq = parallel.pool.DataQueue;
+        afterEach(dq, @(~)progress_update(nComb, PRINT_EVERY));
+        useDQ = true;
+        fprintf('Parallel ON (parfor)\n');
+    catch
+        useParallel = false;
+    end
+end
+if ~useParallel
+    fprintf('Parallel OFF (for)\n');
+end
 
-                % ignora configs que falharam em algum par
-                if any(isnan(score_list))
-                    continue;
-                end
+%% ===================== RODA GRID =====================
+tAll = tic;
 
-                score_global = mean(score_list);
+if useParallel
+    parfor ic = 1:nComb
+        % mapeia ic -> (idx0, idxMed)
+        idx0   = ceil(ic / numel(MEDV));
+        idxMed = ic - (idx0-1)*numel(MEDV);
 
-                if score_global < best_score_global
-                    best_score_global = score_global;
-                    best_cfg.N          = N;
-                    best_cfg.overlap    = overlap;
-                    best_cfg.win_raw    = win_smooth_raw;
-                    best_cfg.win_final  = win_smooth_final;
-                    best_cfg.rmse_pairs = rmse_list;
-                    best_cfg.corr_pairs = corr_list;
+        P = FIX;
 
-                    fprintf('\n>>> Novo MELHOR!  SCORE = %.4f\n', score_global);
-                    fprintf('    N=%3d | overlap=%.2f | win_raw=%3d | win_final=%3d\n\n', ...
-                            N, overlap, win_smooth_raw, win_smooth_final);
-                end
+        P.WAVELET        = GRID.WAVELET{comb0(idx0,1)};
+        P.VOICES_PER_OCT = comb0(idx0,2);
 
+        P.BP_ORDER = comb0(idx0,3);
+        P.BP_WI    = comb0(idx0,4);
+        P.BP_WF    = comb0(idx0,5);
+
+        P.RIDGE_LAMBDA_HZ2 = comb0(idx0,6);
+        P.HARM_RATIO       = comb0(idx0,7);
+        P.MEDIAN_SMOOTH_SEC = MEDV(idxMed);
+
+        out = run_one_pair(CSV_PATH, POLAR_HR_PATH, COL_T_MS, COL_HEART, gap_thr, P);
+
+        res_wavelet_id(ic) = comb0(idx0,1);
+        res_vpo(ic)        = P.VOICES_PER_OCT;
+        res_bp_order(ic)   = P.BP_ORDER;
+        res_bp_wi(ic)      = P.BP_WI;
+        res_bp_wf(ic)      = P.BP_WF;
+        res_lambda_hz2(ic) = P.RIDGE_LAMBDA_HZ2;
+        res_harm_ratio(ic) = P.HARM_RATIO;
+        res_med_sec(ic)    = P.MEDIAN_SMOOTH_SEC;
+
+        res_MAE(ic)  = out.MAE;
+        res_RMSE(ic) = out.RMSE;
+        res_CORR(ic) = out.CORR;
+
+        if useDQ, send(dq,1); end
+    end
+
+    % coleta do parfor (workaround: variáveis temporárias)
+    res.wavelet_id = res_wavelet_id; %#ok<NASGU>
+else
+    count = 0;
+    for idx0 = 1:n0
+        for idxMed = 1:numel(MEDV)
+            count = count + 1;
+
+            P = FIX;
+            P.WAVELET        = GRID.WAVELET{comb0(idx0,1)};
+            P.VOICES_PER_OCT = comb0(idx0,2);
+
+            P.BP_ORDER = comb0(idx0,3);
+            P.BP_WI    = comb0(idx0,4);
+            P.BP_WF    = comb0(idx0,5);
+
+            P.RIDGE_LAMBDA_HZ2 = comb0(idx0,6);
+            P.HARM_RATIO       = comb0(idx0,7);
+            P.MEDIAN_SMOOTH_SEC = MEDV(idxMed);
+
+            out = run_one_pair(CSV_PATH, POLAR_HR_PATH, COL_T_MS, COL_HEART, gap_thr, P);
+
+            res.wavelet_id(count) = comb0(idx0,1);
+            res.vpo(count)        = P.VOICES_PER_OCT;
+            res.bp_order(count)   = P.BP_ORDER;
+            res.bp_wi(count)      = P.BP_WI;
+            res.bp_wf(count)      = P.BP_WF;
+            res.lambda_hz2(count) = P.RIDGE_LAMBDA_HZ2;
+            res.harm_ratio(count) = P.HARM_RATIO;
+            res.med_sec(count)    = P.MEDIAN_SMOOTH_SEC;
+
+            res.MAE(count)  = out.MAE;
+            res.RMSE(count) = out.RMSE;
+            res.CORR(count) = out.CORR;
+
+            if mod(count, PRINT_EVERY)==0 || count==nComb
+                progress_update(nComb, PRINT_EVERY, count, tAll);
             end
         end
     end
 end
 
-%% ==================== RESULTADO FINAL ==================== %%
-
-fprintf('\n================= RESULTADO FINAL DO GRID =================\n');
-fprintf('Melhor configuração:\n');
-fprintf('  N         = %d\n',   best_cfg.N);
-fprintf('  overlap   = %.2f\n', best_cfg.overlap);
-fprintf('  win_raw   = %d (movmean sinal bruto)\n',  best_cfg.win_raw);
-fprintf('  win_final = %d (movmean sinal final)\n', best_cfg.win_final);
-fprintf('  SCORE mín = %.4f  (média de [RMSE/%.1f + (1-corr)] nos 3 pares)\n\n', ...
-        best_score_global, rmse_scale);
-
-for p = 1:nPairs
-    fprintf('Par %d (%s x %s): RMSE = %.4f | Corr = %.4f\n', ...
-        p, pairs{p}.phase, pairs{p}.polar, ...
-        best_cfg.rmse_pairs(p), best_cfg.corr_pairs(p));
+% Se rodou em parfor, precisamos puxar as temporárias do workspace do parfor:
+if useParallel
+    res.wavelet_id = res_wavelet_id;
+    res.vpo        = res_vpo;
+    res.bp_order   = res_bp_order;
+    res.bp_wi      = res_bp_wi;
+    res.bp_wf      = res_bp_wf;
+    res.lambda_hz2 = res_lambda_hz2;
+    res.harm_ratio = res_harm_ratio;
+    res.med_sec    = res_med_sec;
+    res.MAE        = res_MAE;
+    res.RMSE       = res_RMSE;
+    res.CORR       = res_CORR;
 end
 
+fprintf('\nGrid finalizado.\n');
 
-%% ==================== FUNÇÃO: ERRO PARA 1 PAR (PHASE x POLAR) ==================== %%
-function [RMSE_HR_PP, Corr_HR_PP] = compute_error_for_pair( ...
-    phase_path, polar_path, X, ...
-    N, overlap, win_smooth_raw, win_smooth_final, ...
-    f_low, f_high)
+%% ===================== BEST + TOP-10 =====================
+valid = isfinite(res.RMSE);
+if ~any(valid)
+    error('Nenhuma combinação gerou métricas válidas (verifique CSV/Polar).');
+end
 
-    % -------- LEITURA DO CSV DE PHASE --------
-    data  = readmatrix(phase_path);
-    tpuro = data(:,1);
-    heart = data(:,4);
+idx = find(valid);
+M = [res.RMSE(valid), res.MAE(valid), -res.CORR(valid)];
+bestRow = lexicomin_row(M);
+bestIdx = idx(bestRow);
 
-    % tempo em segundos
-    t = (tpuro - tpuro(1)) / 1000;
-    dt = mean(diff(t));
-    srate = 1/dt;
+wbest = GRID.WAVELET{res.wavelet_id(bestIdx)};
+
+fprintf('\n===== MELHOR (menor RMSE; desempate MAE; depois maior CORR) =====\n');
+fprintf('wavelet=%s | VPO=%d | BP=%d [%.2f %.2f] Hz | lambda_hz2=%.1f | harm=%.2f | med=%.1fs\n', ...
+    wbest, res.vpo(bestIdx), res.bp_order(bestIdx), res.bp_wi(bestIdx), res.bp_wf(bestIdx), ...
+    res.lambda_hz2(bestIdx), res.harm_ratio(bestIdx), res.med_sec(bestIdx));
+fprintf('MAE=%.4f | RMSE=%.4f | CORR=%.4f\n', res.MAE(bestIdx), res.RMSE(bestIdx), res.CORR(bestIdx));
+
+[~, ord] = sort(res.RMSE(valid), 'ascend');
+ord = ord(1:min(10,numel(ord)));
+topIdx = idx(ord);
+
+fprintf('\n===== TOP-%d por RMSE =====\n', numel(topIdx));
+for k=1:numel(topIdx)
+    ii = topIdx(k);
+    wk = GRID.WAVELET{res.wavelet_id(ii)};
+    fprintf('#%02d RMSE=%.4f MAE=%.4f CORR=%.4f | w=%s vpo=%d | BP%d[%.2f %.2f] | lam=%.1f harm=%.2f med=%.1fs\n', ...
+        k, res.RMSE(ii), res.MAE(ii), res.CORR(ii), wk, res.vpo(ii), ...
+        res.bp_order(ii), res.bp_wi(ii), res.bp_wf(ii), res.lambda_hz2(ii), res.harm_ratio(ii), res.med_sec(ii));
+end
+
+%% ===================== PLOT DO MELHOR =====================
+if FIX.PLOT_BEST
+    P = FIX;
+    P.WAVELET        = wbest;
+    P.VOICES_PER_OCT = res.vpo(bestIdx);
+    P.BP_ORDER       = res.bp_order(bestIdx);
+    P.BP_WI          = res.bp_wi(bestIdx);
+    P.BP_WF          = res.bp_wf(bestIdx);
+    P.RIDGE_LAMBDA_HZ2= res.lambda_hz2(bestIdx);
+    P.HARM_RATIO     = res.harm_ratio(bestIdx);
+    P.MEDIAN_SMOOTH_SEC= res.med_sec(bestIdx);
+
+    out = run_one_pair(CSV_PATH, POLAR_HR_PATH, COL_T_MS, COL_HEART, gap_thr, P, true); %#ok<NASGU>
+end
+
+fprintf('\nFim. (Sem save)\n');
+
+%% =====================================================================
+%% ===================== FUNÇÕES =====================
+function out = run_one_pair(CSV_PATH, POLAR_HR_PATH, COL_T_MS, COL_HEART, gap_thr, P, doPlot)
+    if nargin < 7, doPlot = false; end
+    out = struct('MAE',NaN,'RMSE',NaN,'CORR',NaN);
+
+    data = readmatrix(CSV_PATH);
+    if size(data,2) < max(COL_T_MS, COL_HEART), return; end
+
+    tpuro = data(:,COL_T_MS);
+    x0    = data(:,COL_HEART);
+
+    tpuro = tpuro(:); x0 = x0(:);
+    okx = isfinite(x0);
+    if ~all(okx)
+        x0(~okx) = interp1(find(okx), x0(okx), find(~okx), 'linear', 'extrap');
+    end
+
+    t = (tpuro - tpuro(1))/1000;
+    [t, ia] = unique(t, 'stable');
+    x0 = x0(ia);
+
     nt = numel(t);
+    if nt < 64, return; end
 
-    % -------- DETECTAR QUEBRAS dt > 0.5 s E SEGMENTOS --------
-    dt_all   = diff(t);
-    break_ix = find(dt_all > 0.5);   % índices onde há "buraco" no tempo
+    dt_all = diff(t);
+    break_ix = find(dt_all > gap_thr);
 
     if isempty(break_ix)
-        seg_starts = 1;
-        seg_ends   = nt;
+        seg_starts = 1; seg_ends = nt;
     else
-        seg_starts = [1; break_ix + 1];
+        seg_starts = [1; break_ix+1];
         seg_ends   = [break_ix; nt];
     end
-    nSeg = numel(seg_starts);
 
-    % -------- AUTO FREX PELO ESPECTRO DO HEART --------
-    Nfft  = 2*nt - 1;
-    f_fft = linspace(0, srate, Nfft);
-    H     = fft(heart, Nfft);
-    magH  = abs(H);
+    hr_bpm = nan(nt,1);
 
-    [~, imax] = max(magH);
-    frex = f_fft(imax);
+    for s = 1:numel(seg_starts)
+        idx = seg_starts(s):seg_ends(s);
+        if numel(idx) < 64, continue; end
 
-    if frex <= 0
-        RMSE_HR_PP = NaN;
-        Corr_HR_PP = NaN;
+        t_seg = t(idx);
+        x_seg = x0(idx);
+
+        dt_seg = diff(t_seg);
+        if any(dt_seg <= 0), continue; end
+        fs = 1/mean(dt_seg);
+
+        % DC
+        x_seg = x_seg - mean(x_seg);
+
+        % ====== FILTRO (NOVO) ======
+        if ~isempty(P.BP_ORDER) && P.BP_ORDER > 0
+            if ~(isfinite(P.BP_WI) && isfinite(P.BP_WF) && P.BP_WI > 0 && P.BP_WI < P.BP_WF && P.BP_WF < fs/2)
+                continue;
+            end
+            [b,a] = butter(P.BP_ORDER, [P.BP_WI P.BP_WF]/(fs/2), 'bandpass');
+            if any(~isfinite(x_seg)), continue; end
+            x_seg = filtfilt(b,a,x_seg);
+        end
+
+        if any(~isfinite(x_seg)), continue; end
+
+        % CWT compatível
+        [wt,f] = get_cwt_compat(x_seg, fs, P.WAVELET, P.VOICES_PER_OCT);
+        f = f(:);
+        [f, ord] = sort(f,'ascend');
+        wt = wt(ord,:);
+
+        Pow = abs(wt).^2;
+        if isempty(Pow) || size(Pow,2) ~= numel(idx), continue; end
+
+        % evita DC (bin 1)
+        Pow(1,:) = 0;
+
+        Pnorm = Pow ./ (max(Pow,[],1) + eps);
+
+        ridge_f = ridge_track_continuity_hz(Pnorm, f, P.RIDGE_LAMBDA_HZ2);
+        ridge_f = harmonic_fix_half(Pow, f, ridge_f, P.HARM_RATIO);
+
+        bpm = 60 * ridge_f(:);
+
+        % suavização por segmento (mediana + movmean FIXO)
+        wMed  = max(3, round(P.MEDIAN_SMOOTH_SEC * fs));
+        wMean = max(3, round(P.MEAN_SMOOTH_SEC   * fs));
+
+        bpm = movmedian(bpm, wMed, 'omitnan');
+        if P.FILL_NAN_WITHIN_SEG
+            bpm = fill_nan_by_interp(t_seg, bpm);
+        end
+        bpm = movmean(bpm, wMean, 'omitnan');
+
+        hr_bpm(idx) = bpm;
+    end
+
+    if ~P.DO_POLAR_COMPARE || ~isfile(POLAR_HR_PATH)
+        if doPlot
+            figure('Color','w'); plot(t, hr_bpm, 'k', 'LineWidth', 1.4); grid on;
+            xlabel('t (s)'); ylabel('HR (bpm)');
+            title(sprintf('Radar HR | wavelet=%s vpo=%d | BP%d[%.2f %.2f] | lam=%.1f harm=%.2f med=%.1fs', ...
+                P.WAVELET, P.VOICES_PER_OCT, P.BP_ORDER, P.BP_WI, P.BP_WF, P.RIDGE_LAMBDA_HZ2, P.HARM_RATIO, P.MEDIAN_SMOOTH_SEC));
+        end
         return;
     end
 
-    % -------- DEFINIR h = X/frex --------
-    h = X / frex;         % em segundos
-    h = max(h, 0.1);      % limites de segurança
-    h = min(h, 5.0);
-
-    % -------- WAVELET & CONVOLUÇÃO --------
-    idx   = (1:nt) - ceil(nt/2);
-    t_aux = idx(:) * dt;
-
-    gaus = exp((-4*log(2)*t_aux.^2)/h^2) .* exp(1i*2*pi*frex*t_aux);
-
-    nGaus    = length(gaus);
-    nHeart   = length(heart);
-    nConv    = nGaus + nHeart - 1;
-
-    heartX = fft(heart, nConv);
-    gausX  = fft(gaus,  nConv);
-    gausX  = gausX ./ max(gausX);
-
-    convX     = heartX .* gausX;
-    convs_all = ifft(convX);
-
-    % recorte "same": mesmo tamanho e alinhado ao heart
-    startIdx = floor(nGaus/2) + 1;
-    endIdx   = startIdx + nt - 1;
-    convs    = convs_all(startIdx:endIdx);
-
-    % -------- FFT POR JANELAS EM "convs" --------
-    hop     = max(1, round(N*(1-overlap)));
-    halfN   = N/2;
-    rel_idx = -halfN : (halfN-1);
-
-    freq_weighted_sum = zeros(nt,1);
-    weight_sum        = zeros(nt,1);
-
-    for s = 1:nSeg
-        seg_start = seg_starts(s);
-        seg_end   = seg_ends(s);
-
-        center_list = seg_start : hop : seg_end;
-
-        for center_theoretical = center_list
-            idx_theo = center_theoretical + rel_idx;
-            idx_win  = idx_theo(idx_theo >= seg_start & idx_theo <= seg_end);
-
-            if numel(idx_win) < 4
-                continue;
-            end
-
-            t_seg = t(idx_win);
-            x_seg = real(convs(idx_win));
-
-            dt_seg = diff(t_seg);
-            if any(dt_seg <= 0) || any(isnan(dt_seg))
-                continue;
-            end
-
-            fs_seg = 1/mean(dt_seg);
-
-            x_seg = x_seg - mean(x_seg);
-
-            Xw        = fft(x_seg);
-            nFFT_win  = numel(x_seg);
-            halfFFT   = floor(nFFT_win/2);
-            f_ax      = (0:halfFFT-1) * fs_seg / nFFT_win;
-            magX_win  = abs(Xw(1:halfFFT));
-
-            mask = (f_ax >= f_low) & (f_ax <= f_high);
-            if ~any(mask)
-                continue;
-            end
-
-            [~, imax_win] = max(magX_win(mask));
-            f_band = f_ax(mask);
-            f_est  = f_band(imax_win);
-            bpm    = f_est * 60;
-
-            % acumula contribuição ponderada desta janela
-            for ii = idx_win
-                dist = abs(ii - center_theoretical);
-                w = (halfN + 1) - dist;
-                if w < 0, w = 0; end
-                freq_weighted_sum(ii) = freq_weighted_sum(ii) + bpm * w;
-                weight_sum(ii)        = weight_sum(ii)        + w;
-            end
-        end
-    end
-
-    % -------- HR POR AMOSTRA (bruto) --------
-    freq_h_raw = nan(nt,1);
-    valid = weight_sum > 0;
-    freq_h_raw(valid) = freq_weighted_sum(valid) ./ weight_sum(valid);
-
-    % -------- SUAVIZAÇÃO DENTRO DE CADA SEGMENTO (RAW) --------
-    freq_h_smooth = nan(nt,1);
-    for s = 1:nSeg
-        idx_seg = seg_starts(s):seg_ends(s);
-        seg_raw = freq_h_raw(idx_seg);
-        freq_h_smooth(idx_seg) = movmean(seg_raw, win_smooth_raw, 'omitnan');
-    end
-
-    % -------- INTERPOLAÇÃO PARA FECHAR BURACOS --------
-    idx_good = ~isnan(freq_h_smooth);
-    if any(idx_good) && any(~idx_good)
-        freq_h_smooth(~idx_good) = interp1(t(idx_good), freq_h_smooth(idx_good), ...
-                                           t(~idx_good), 'linear', 'extrap');
-    end
-
-    % -------- SEGUNDA SUAVIZAÇÃO (FINAL, POR SEGMENTO) --------
-    freq_h_final = nan(nt,1);
-    for s = 1:nSeg
-        idx_seg     = seg_starts(s):seg_ends(s);
-        seg_smooth  = freq_h_smooth(idx_seg);
-        freq_h_final(idx_seg) = movmean(seg_smooth, win_smooth_final, 'omitnan');
-    end
-
-    t_phase        = t;
-    HR_radar_phase = freq_h_final;
-
-    % -------- LER POLAR --------
-    [t_polar, HR_polar] = read_txt_polar(polar_path);
-    [t_polar, ia] = unique(t_polar,'stable');
+    [t_polar, HR_polar] = read_txt_polar(POLAR_HR_PATH);
+    [t_polar, ia] = unique(t_polar, 'stable');
     HR_polar = HR_polar(ia);
 
-    % -------- ALINHAR E COMPARAR --------
-    dt_HR_PP   = min(median(diff(t_phase)), median(diff(t_polar)));
-    tmin_HR_PP = max([t_phase(1), t_polar(1)]);
-    tmax_HR_PP = min([t_phase(end), t_polar(end)]);
+    okR = isfinite(t) & isfinite(hr_bpm);
+    okP = isfinite(t_polar) & isfinite(HR_polar);
+    if nnz(okR) < 2 || nnz(okP) < 2, return; end
 
-    if tmax_HR_PP <= tmin_HR_PP
-        RMSE_HR_PP = NaN;
-        Corr_HR_PP = NaN;
-        return;
+    t_start = max(t(find(okR,1,'first')), t_polar(find(okP,1,'first')));
+    t_end   = min(t(find(okR,1,'last')),  t_polar(find(okP,1,'last')));
+    if ~(isfinite(t_start) && isfinite(t_end)) || (t_end <= t_start), return; end
+
+    t_common = (t_start:P.DT_GRID:t_end)';
+    HR_radar_grid = interp1(t(okR), hr_bpm(okR), t_common, 'linear');
+    HR_polar_grid = interp1(t_polar(okP), HR_polar(okP), t_common, 'linear');
+
+    mask_time = (t_common >= (t_start + P.IGNORE_START_SEC));
+    HR_ref  = HR_polar_grid(mask_time);
+    HR_test = HR_radar_grid(mask_time);
+
+    ok = isfinite(HR_ref) & isfinite(HR_test);
+    if nnz(ok) < 10, return; end
+
+    err = HR_test(ok) - HR_ref(ok);
+
+    out.MAE  = mean(abs(err), 'omitnan');
+    out.RMSE = sqrt(mean(err.^2, 'omitnan'));
+    out.CORR = corr(HR_test(ok), HR_ref(ok), 'Rows','complete');
+
+    if doPlot
+        figure('Color','w');
+        plot(t_polar, HR_polar, 'm.-', 'LineWidth', 1, 'MarkerSize', 8); hold on;
+        plot(t, hr_bpm, 'k', 'LineWidth', 1.4);
+        grid on; xlabel('t (s)'); ylabel('HR (bpm)');
+        legend('Polar','Radar','Location','best');
+        title(sprintf('BEST | MAE=%.3f RMSE=%.3f CORR=%.3f | w=%s vpo=%d | BP%d[%.2f %.2f] | lam=%.1f harm=%.2f med=%.1fs', ...
+            out.MAE, out.RMSE, out.CORR, P.WAVELET, P.VOICES_PER_OCT, P.BP_ORDER, P.BP_WI, P.BP_WF, P.RIDGE_LAMBDA_HZ2, P.HARM_RATIO, P.MEDIAN_SMOOTH_SEC));
     end
-
-    t_grid_HR_PP = (tmin_HR_PP : dt_HR_PP : tmax_HR_PP).';
-
-    HR_phase_PP = interp1(t_phase, HR_radar_phase, t_grid_HR_PP,'linear');
-    HR_polar_PP = interp1(t_polar, HR_polar,      t_grid_HR_PP,'linear');
-
-    % descartar início (lock-in), se tiver muitos pontos
-    if numel(HR_phase_PP) > 250
-        HR_phase_PP = HR_phase_PP(251:end);
-        HR_polar_PP = HR_polar_PP(251:end);
-    end
-
-    err = HR_phase_PP - HR_polar_PP;
-
-    RMSE_HR_PP = sqrt(mean(err.^2));
-    Corr_HR_PP = corr(HR_phase_PP, HR_polar_PP, 'rows','complete');
 end
 
-%% ==================== FUNÇÃO: LEITURA POLAR ==================== %%
+function [cfs,f] = get_cwt_compat(x, fs, wname, vpo)
+    L = numel(x);
+
+    if exist('cwtfilterbank','file')
+        try
+            fb = cwtfilterbank('SignalLength', L, ...
+                               'SamplingFrequency', fs, ...
+                               'VoicesPerOctave', vpo, ...
+                               'Wavelet', wname);
+        catch
+            fb = cwtfilterbank('SignalLength', L, ...
+                               'SamplingFrequency', fs, ...
+                               'VoicesPerOctave', vpo, ...
+                               'Wavelet', 'morse');
+        end
+
+        try, [cfs,f] = cwt(fb, x); return; catch, end
+        try, [cfs,f] = cwt(x, 'FilterBank', fb); return; catch, end
+        try, [cfs,f] = fb.cwt(x); return; catch, end
+
+        error('cwtfilterbank existe, mas não encontrei forma compatível de aplicar a CWT.');
+    end
+
+    try, [cfs,f] = cwt(x, fs); return; catch, end
+    try, [cfs,f] = cwt(x, 1/fs); return; catch, end
+    error('Sem suporte a CWT nesta instalação.');
+end
+
+function ridge_f = ridge_track_continuity_hz(Pnorm, f, lambda_hz2)
+    [~,L] = size(Pnorm);
+    ridge_f = nan(1,L);
+
+    [~, i0] = max(Pnorm(:,1));
+    ridge_f(1) = f(i0);
+    fprev = ridge_f(1);
+
+    for k = 2:L
+        penal = lambda_hz2 * (f - fprev).^2;
+        score = Pnorm(:,k) - penal;
+        [~, ik] = max(score);
+        ridge_f(k) = f(ik);
+        fprev = ridge_f(k);
+    end
+end
+
+function ridge_f = harmonic_fix_half(P, f, ridge_f, ratio)
+    L = size(P,2);
+    for k = 1:L
+        fk = ridge_f(k);
+        if isnan(fk) || fk <= 0, continue; end
+        [~, i1] = min(abs(f - fk));
+        [~, i2] = min(abs(f - fk/2));
+        p1 = P(i1,k); p2 = P(i2,k);
+        if p2 >= ratio * p1
+            ridge_f(k) = fk/2;
+        end
+    end
+end
+
+function x = fill_nan_by_interp(t, x)
+    ok = ~isnan(x);
+    if nnz(ok) >= 2
+        x(~ok) = interp1(t(ok), x(ok), t(~ok), 'linear', 'extrap');
+    end
+end
+
 function [t_sec, HR] = read_txt_polar(p)
     fid = fopen(p,'r');
+    if fid == -1, error('Não foi possível abrir o Polar: %s', p); end
     C = textscan(fid,'%s %f %*[^\n]','Delimiter',';','HeaderLines',1);
     fclose(fid);
 
     ts_str = C{1};
     HR     = C{2};
 
-    t_dt  = datetime(ts_str,'InputFormat','yyyy-MM-dd''T''HH:mm:ss.SSS');
+    try
+        t_dt = datetime(ts_str,'InputFormat','yyyy-MM-dd''T''HH:mm:ss.SSS');
+    catch
+        t_dt = datetime(ts_str,'InputFormat','yyyy-MM-dd HH:mm:ss.SSS');
+    end
     t_sec = seconds(t_dt - t_dt(1));
+end
+
+function progress_update(nTotal, printEvery, count, tAll)
+    if nargin < 3
+        % usado via DataQueue
+        persistent c t0
+        if isempty(c), c = 0; t0 = tic; end
+        c = c + 1;
+        if mod(c, printEvery)==0 || c==nTotal
+            dt = toc(t0);
+            rate = c / max(dt, eps);
+            eta  = (nTotal - c) / max(rate, eps);
+            fprintf('Progresso: %d/%d (%.1f%%) | %.2f comb/s | ETA ~ %.1fs\n', ...
+                c, nTotal, 100*c/nTotal, rate, eta);
+        end
+    else
+        dt = toc(tAll);
+        rate = count / max(dt, eps);
+        eta  = (nTotal - count) / max(rate, eps);
+        fprintf('Progresso: %d/%d (%.1f%%) | %.2f comb/s | ETA ~ %.1fs\n', ...
+            count, nTotal, 100*count/nTotal, rate, eta);
+    end
+end
+
+function row = lexicomin_row(M)
+    [~, order] = sortrows(M, 1:size(M,2));
+    row = order(1);
 end

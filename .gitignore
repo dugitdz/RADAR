@@ -1,0 +1,4 @@
+
+# Ignore specific datasets folders (keep other output files tracked)
+PROJ_ESP32/output/datasets/Figshare/
+PROJ_ESP32/output/datasets/Mendeley/

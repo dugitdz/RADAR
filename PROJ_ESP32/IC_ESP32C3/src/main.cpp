@@ -1,173 +1,115 @@
 #include <Arduino.h>
-#include "LD6002.h"
 #include <stdint.h>
+#include <string.h>
 
-// ---------- CÓDIGO 1: LD6002 (x15, x14) ----------
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
-LD6002 radar(Serial1);
+static const uint32_t RADAR_BAUD = 1382400;
+static const int RADAR_RX = 21;
+static const int RADAR_TX = 20;
 
-float lastHeartRate  = 0;
-float lastBreathRate = 0;
-float lastDistance   = 0;
+static const char *BLE_NAME     = "ESP32C3_IC";
+static const char *SERVICE_UUID = "ABCD";
+static const char *CHAR_UUID    = "1234";
 
-// ---------- CÓDIGO 2: LEITURA DIRETA (x13) ----------
+BLECharacteristic *g_char = nullptr;
+static volatile bool g_connected = false;
 
-float leitor_bytes_phase(uint8_t *aux);
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *pServer) override { g_connected = true; }
+  void onDisconnect(BLEServer *pServer) override {
+    g_connected = false;
+    BLEDevice::startAdvertising();
+  }
+};
 
-// variáveis do parser x13 (mantidas como no seu código)
-uint8_t prox_byte = 0;
-static uint8_t buffer[32];
-int len = 0;
-float heart_phase, total_phase, breath_phase, dist;
-static unsigned long t_phase = 0, t_dist = 0;
-static bool b_phase = false, b_dist = false;
-static const unsigned long MAX_dt = 100;
-
-// criador de CSV: exatamente o mesmo print que você já fazia
-void escreveCSV(unsigned long t_out,
-                float total_phase,
-                float breath_phase,
-                float heart_phase,
-                float dist)
-{
-  Serial.print(t_out);       Serial.print(",");
-  Serial.print(total_phase); Serial.print(",");
-  Serial.print(breath_phase);Serial.print(",");
-  Serial.print(heart_phase); Serial.print(",");
-  Serial.println(dist);
+static inline void pack_float_le(float x, uint8_t out4[4]) {
+  memcpy(out4, &x, 4);
 }
 
-void setup()
-{
-  // Mantendo o baud do SEGUNDO código (você pode mudar se quiser)
-  Serial.begin(1382400);
+void setup() {
 
-  // Serial1 igual em ambos os códigos
-  Serial1.begin(1382400, SERIAL_8N1, 21, 20);
+  // Radar
+  Serial1.begin(RADAR_BAUD, SERIAL_8N1, RADAR_RX, RADAR_TX);
+  Serial.begin(115200);
   Serial1.setTimeout(60);
 
-  // Cabeçalho CSV do segundo código
-  Serial.println("tempo,total_phase,breath_phase,heart_phase,dist");
+  // BLE
+  BLEDevice::init(BLE_NAME);
+  BLEServer *server = BLEDevice::createServer();
+  server->setCallbacks(new MyServerCallbacks());
+
+  BLEService *service = server->createService(SERVICE_UUID);
+
+  g_char = service->createCharacteristic(
+    CHAR_UUID,
+    BLECharacteristic::PROPERTY_READ |
+    BLECharacteristic::PROPERTY_WRITE |
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+  g_char->addDescriptor(new BLE2902());
+
+  service->start();
+
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(SERVICE_UUID);
+  adv->start();
 }
 
-void loop()
-{
-  // ---------- PARTE 1: código do LD6002 (x15, x14) ----------
+void loop() {
 
-  radar.update();
+  static const int REST_A13 = 14;
+  static const int REST_A14 = 6;
+  static const int REST_A15 = 6;
+  static const int REST_A16 = 10;
 
-  if (radar.hasNewHeartRate())
-  {
-    float heartRateMain = radar.getHeartRate();
-    if ((heartRateMain != lastHeartRate) && (heartRateMain > 0))
-    {
-      Serial.printf("Heart Rate: %.2f\n", heartRateMain);
-    }
-    lastHeartRate = heartRateMain;
-    radar.clearHeartRateFlag();
-  }
+  static uint8_t restbuf[32];
 
-  if (radar.hasNewBreathRate())
-  {
-    float breathRateMain = radar.getBreathRate();
-    if ((breathRateMain != lastBreathRate) && (breathRateMain > 0))
-    {
-      Serial.printf("Breath Rate: %.2f\n", breathRateMain);
-    }
-    lastBreathRate = breathRateMain;
-    radar.clearBreathRateFlag();
-  }
+  static uint8_t out_pkt[15 + 4];
 
-  if (radar.hasNewDistance())
-  {
-    float distanceMain = radar.getDistance();
-    if ((distanceMain != lastDistance) && (distanceMain > 0))
-    {
-      Serial.printf("Distance: %.2f\n", distanceMain);
-    }
-    lastDistance = distanceMain;
-    radar.clearDistanceFlag();
-  }
+  while (Serial1.available()) {
+    uint8_t b = (uint8_t)Serial1.read();
+    if (b != 0x0A) continue; // 1o byte do TYPE (0x0A)
 
-  // ---------- PARTE 2: código do parser x13 (mantido) ----------
+    uint8_t type2;
+    if (Serial1.readBytes(&type2, 1) != 1) continue; // 2o byte do TYPE (0x13/14/15/16)
 
-  while (Serial1.available())
-  {
-    uint8_t s = Serial1.read();
-    if (s == 0x0A)
-    {
-      if (Serial1.readBytes(&prox_byte, 1) != 1) continue;
-
-      switch (prox_byte)
-      {
-      case 0x13:
-        len = 14;
-        if (len > (int)sizeof(buffer)) break;
-        buffer[0] = prox_byte;
-        {
-          size_t tam = Serial1.readBytes(&buffer[1], len - 1);
-          if (tam != len - 1) break;
-        }
-        t_phase = millis();
-        total_phase  = leitor_bytes_phase(&buffer[2]);
-        breath_phase = leitor_bytes_phase(&buffer[6]);
-        heart_phase  = leitor_bytes_phase(&buffer[10]);
-        b_phase = true;
-        if (b_dist)
-        {
-          unsigned long dt = (t_phase > t_dist) ? (t_phase - t_dist) : (t_dist - t_phase);
-          if (dt <= MAX_dt)
-          {
-            unsigned long t_out = (t_phase > t_dist) ? t_phase : t_dist;
-            // AQUI usamos o criador de CSV (mesmo print que você já tinha)
-            escreveCSV(t_out, total_phase, breath_phase, heart_phase, dist);
-            b_dist = false;
-            b_phase = false;
-          }
-        }
-        break;
-
-      case 0x16:
-        len = 10;
-        if (len > (int)sizeof(buffer)) break;
-        buffer[0] = prox_byte;
-        {
-          size_t tam = Serial1.readBytes(&buffer[1], len - 1);
-          if (tam != len - 1) break;
-        }
-        t_dist = millis();
-        dist = leitor_bytes_phase(&buffer[6]);
-        b_dist = true;
-        if (b_phase)
-        {
-          unsigned long dt = (t_phase > t_dist) ? (t_phase - t_dist) : (t_dist - t_phase);
-          if (dt <= MAX_dt)
-          {
-            unsigned long t_out = (t_phase > t_dist) ? t_phase : t_dist;
-            // Mesmo CSV
-            escreveCSV(t_out, total_phase, breath_phase, heart_phase, dist);
-            b_dist = false;
-            b_phase = false;
-          }
-        }
-        break;
-
-      case 0x14:
+    int need = 0;
+    switch (type2) {
+      case 0x13: need = REST_A13; break;
+      case 0x14: need = REST_A14; break;
+      case 0x15: need = REST_A15; break;
+      case 0x16: need = REST_A16; break;
       default:
-        break;
+        continue;
+    }
+
+    if (need > (int)sizeof(restbuf)) continue;
+
+    size_t got = Serial1.readBytes(restbuf, (size_t)need);
+    if (got != (size_t)need) continue;
+
+    if (type2 == 0x13) {
+
+      out_pkt[0] = 0x13;
+      memcpy(&out_pkt[1], restbuf, REST_A13);
+
+      float t_ms = (float)millis();
+      Serial.print("\nTimestamp (ms): ");
+      Serial.println(t_ms);
+      uint8_t t4[4];
+      pack_float_le(t_ms, t4);
+
+      memcpy(&out_pkt[15], t4, 4);
+
+      // BLE notify
+      if (g_connected && g_char) {
+        g_char->setValue(out_pkt, sizeof(out_pkt));
+        g_char->notify();
       }
     }
   }
-}
-
-// função de conversão de bytes -> float (mantida igual)
-float leitor_bytes_phase(uint8_t *aux)
-{
-  uint32_t u = (uint32_t)aux[0]
-             | ((uint32_t)aux[1] << 8)
-             | ((uint32_t)aux[2] << 16)
-             | ((uint32_t)aux[3] << 24);
-  float f;
-  memcpy(&f, &u, 4);
-  return f;
 }

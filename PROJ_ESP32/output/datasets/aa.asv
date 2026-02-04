@@ -1,0 +1,46 @@
+%% ===================== DEBUG: POTÊNCIA por bin (FRAME + JANELA) + freq escolhida (RIDGE) =====================
+% Requer que já existam no workspace:
+%   P (nb x nt), f_bin (nb x 1), t (nt x 1), freq_bpm (nt x 1)
+% Não mexe em nada do ridge. Só plota e printa.
+
+t0 = 195;                 % tempo (s) do frame
+t1 = 200.0;  t2 = 260.0;    % janela (s)
+
+% --- resolve frame do t0 ---
+[~, ii0] = min(abs(t - t0));
+t0_eff = t(ii0);
+
+% --- resolve janela ---
+if t2 < t1, tmp=t1; t1=t2; t2=tmp; end
+i1 = find(t >= t1, 1, 'first');
+i2 = find(t <= t2, 1, 'last');
+i1 = max(1, i1);
+i2 = min(size(P,2), i2);
+
+% --- frequência escolhida (pelo ridge já calculado) ---
+f_sel_bpm = freq_bpm(ii0);
+f_sel_hz  = f_sel_bpm/60;
+
+fprintf('[RIDGE] t0_req=%.3fs | ii0=%d | t=%.3fs | f*=%.4f Hz (%.2f bpm)\n', ...
+    t0, ii0, t0_eff, f_sel_hz, f_sel_bpm);
+
+% ===================== PLOT 1: FRAME =====================
+P_frame_lin = P(:, ii0);
+P_frame_db  = 10*log10(P_frame_lin + eps);
+
+figure('Name','P(f) por bin - FRAME','Color','w');
+plot(60*f_bin, P_frame_db, 'LineWidth', 1.6); hold on;
+xline(f_sel_bpm, '--', 'LineWidth', 1.4);
+grid on; xlabel('Frequência (bpm)'); ylabel('Potência (dB rel.)');
+title(sprintf('P(f) no frame: t=%.3fs (ii=%d) | ridge=%.2f bpm', t0_eff, ii0, f_sel_bpm));
+
+% ===================== PLOT 2: JANELA =====================
+P_win_lin = median(P(:, i1:i2), 2);   % use mean(...) ou max(...) se preferir
+P_win_db  = 10*log10(P_win_lin + eps);
+
+figure('Name','P(f) por bin - JANELA','Color','w');
+plot(60*f_bin, P_win_db, 'LineWidth', 1.6); hold on;
+xline(f_sel_bpm, '--', 'LineWidth', 1.4);
+grid on; xlabel('Frequência (bpm)'); ylabel('Potência (dB rel.)');
+title(sprintf('Mediana P(f) janela %.3f–%.3fs (frames %d..%d) | ridge@t0=%.2f bpm', ...
+    t(i1), t(i2), i1, i2, f_sel_bpm));

@@ -1,0 +1,651 @@
+clc; clear; close all;
+
+%% ===================== PARÂMETROS =====================
+INPUT_PATH = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\datasets\Figshare\dta\GDN0008\GDN0008_2_Valsalva.mat';
+INPUT_MODE = 'ecg1';
+
+wi = 0.5;
+wf = 3.5;
+SRATE_TARGET = 25;
+
+GATE_ON     = 1;
+HR_MIN_BPM  = 55;
+HR_MAX_BPM  = 210;
+DELTA_DB    = -3;
+SMOOTH_BINS = 1;
+GATE_FLOOR  = 0.0;
+
+BP_ORDER = 8;
+BP_WI    = 0.6;
+BP_WF    = 3.0;
+
+% ===== FIX BP =====
+BP_STRICT_NO_LIFT = ;   % 0 = só normaliza ganho; 1 = clamp por-bin (garantia absoluta)
+
+VOICES_PER_OCT = 48;
+DB_FLOOR_PLOT  = -25;
+
+BAND_W_HZ          = 0.15;
+DB_FLOOR_BAND      = -25;
+RIDGE_LAMBDA       = 0.2;
+F_JUMP_HZ          = 0.15;
+BURNIN_SEC         = 0;
+K_EVENT            = 30;
+PUNISH_CHAIN_GAMMA = 0.8;
+PUNISH_CHAIN_MAX   = 12;
+
+ECG_MIN_DIST_SEC = 0.35;
+ECG_MIN_PROM     = 2.0;
+HR_MIN_BPM_ECG   = 30;
+HR_MAX_BPM_ECG   = 220;
+
+TIMING_ON = 1;
+t_global  = tic;
+
+%% ===================== LEITURA =====================
+[tpuro_ms, heart, baseName] = load_phase_for_algorithm(INPUT_PATH);
+heart = heart(:);
+heart = heart - mean(heart,'omitnan');
+
+%% ===================== SRATE ROBUSTO =====================
+t0 = (tpuro_ms - tpuro_ms(1))/1000; t0 = t0(:);
+dt_pos = diff(t0); dt_pos = dt_pos(dt_pos > 0);
+if isempty(dt_pos), error('Tempo inválido: diff(t) sem valores positivos.'); end
+dt0    = median(dt_pos);
+srate0 = 1/dt0;
+
+%% ===================== RESAMPLE =====================
+t0dur = (numel(heart)-1)/srate0;
+[p,q] = rat(SRATE_TARGET/srate0, 1e-12);
+
+heart = resample(heart, p, q);
+srate = srate0 * p / q;
+t     = (0:numel(heart)-1)'/srate;
+if t(end) > t0dur, t(end) = t0dur; end
+
+if TIMING_ON, fprintf('[T] load+resample: %.3fs | Fs=%.4f\n', toc(t_global), srate); end
+
+if wf >= (srate/2), error('wf precisa ser < Nyquist.'); end
+if wi <= 0 || wi >= wf, error('wi/wf inválidos.'); end
+
+heart_puro = heart;
+
+%% ===================== GATE (ANTES DO BP) =====================
+if TIMING_ON, t_gate = tic; end
+if GATE_ON
+    [heart_gate, gate_dbg] = gate_by_power_hr(heart_puro, srate, HR_MIN_BPM, HR_MAX_BPM, DELTA_DB, SMOOTH_BINS, GATE_FLOOR);
+else
+    heart_gate = heart_puro;
+    gate_dbg = struct('Pdb_hr_peak',NaN,'Pdb_thr',NaN);
+end
+if TIMING_ON
+    fprintf('[T] gate: %.3fs | hr_peak=%.2f dB | thr=%.2f dB\n', toc(t_gate), gate_dbg.Pdb_hr_peak, gate_dbg.Pdb_thr);
+end
+
+%% ===================== BANDPASS (CORRIGIDO) =====================
+if BP_WF >= (srate/2), error('BP_WF precisa ser < Nyquist.'); end
+if BP_WI <= 0 || BP_WI >= BP_WF, error('BP_WI/BP_WF inválidos.'); end
+
+if TIMING_ON, t_bp = tic; end
+
+Wn = [BP_WI BP_WF]/(srate/2);
+
+[z,pz,kz] = butter(BP_ORDER, Wn, 'bandpass');
+[sosBP, gBP] = zp2sos(z,pz,kz);         % <<< pega ganho correto
+
+% normaliza max|H| = 1  (filtfilt => |H|^2, ainda <=1)
+gBP = gBP / max_sos_mag(sosBP, gBP, srate);
+
+heart = sosfiltfilt_compat(sosBP, gBP, heart_gate);
+
+% opcional: garantia absoluta "não levantar bin do espectro"
+if BP_STRICT_NO_LIFT
+    Xg  = fft(heart_gate);
+    Xbp = fft(heart);
+    Mg  = abs(Xg);
+    Mbp = abs(Xbp);
+
+    scale = ones(size(Mbp));
+    idx = (Mbp > Mg) & (Mbp > 0);
+    scale(idx) = Mg(idx) ./ Mbp(idx);
+
+    heart = real(ifft(Xbp .* scale, 'symmetric'));
+end
+
+if TIMING_ON
+    fprintf('[T] BP: %.3fs | ord=%d | [%.3f..%.3f] Hz | strict=%d\n', ...
+        toc(t_bp), BP_ORDER, BP_WI, BP_WF, BP_STRICT_NO_LIFT);
+end
+
+%% ===================== PSD overlay =====================
+[fpsd, P_puro] = psd_one_sided(heart_puro, srate);
+[~,    P_gate] = psd_one_sided(heart_gate, srate);
+[~,    P_bp]   = psd_one_sided(heart,      srate);
+
+mpsd = (fpsd >= wi) & (fpsd <= wf);
+
+figure('Name','PSD overlay (dB)','Color','w');
+plot(fpsd(mpsd), 10*log10(P_puro(mpsd)+eps), 'LineWidth', 1.2); hold on;
+plot(fpsd(mpsd), 10*log10(P_gate(mpsd)+eps), 'LineWidth', 1.2);
+plot(fpsd(mpsd), 10*log10(P_bp(mpsd)+eps),   'LineWidth', 1.6);
+grid on; xlabel('Frequência (Hz)'); ylabel('Potência (dB a.u.)');
+title(sprintf('PSD (dB) | %s | Fs=%.2f | GATE=%d', baseName, srate, GATE_ON));
+legend('puro (pós-resample)','pós-gate','pós-gate+BP','Location','best');
+
+%% ===================== CWT =====================
+if TIMING_ON, t_cwt = tic; end
+[wt, f_bin] = cwt(heart,'amor',srate, 'FrequencyLimits',[wi wf], 'VoicesPerOctave',VOICES_PER_OCT);
+if TIMING_ON, fprintf('[T] cwt: %.3fs\n', toc(t_cwt)); end
+
+f_bin = f_bin(:);
+if numel(f_bin) > 1 && f_bin(2) < f_bin(1)
+    f_bin = flipud(f_bin);
+    wt    = flipud(wt);
+end
+
+P  = abs(wt).^2;
+nb = numel(f_bin);
+nt = size(P,2);
+
+df = gradient(f_bin); df(df<=0) = eps;
+
+%% ===================== RIDGE (area + punish) =====================
+burnin_frames = max(1, round(BURNIN_SEC * srate));
+
+% pré-calcula end_idx (banda por área)
+end_idx = zeros(nb,1);
+j = 1;
+for i = 1:nb
+    if j < i, j = i; end
+    f_end = f_bin(i) + BAND_W_HZ;
+    while (j < nb) && (f_bin(j+1) <= f_end)
+        j = j + 1;
+    end
+    end_idx(i) = j;
+end
+
+% matriz de índices para achar pico local rápido
+len_i  = end_idx - (1:nb)' + 1;
+maxLen = max(len_i);
+IDX    = zeros(nb, maxLen, 'int32');
+base = int32((1:nb)');
+
+for kk = 1:maxLen
+    idxk = base + int32(kk-1);
+    okk  = idxk <= int32(end_idx);
+    tmp = zeros(nb,1,'int32');
+    tmp(okk) = idxk(okk);
+    IDX(:,kk) = tmp;
+end
+IDX_safe = IDX; IDX_safe(IDX_safe==0) = 1;
+
+imax = zeros(nt,1,'int32');
+
+prev_f_normal  = NaN;
+prev_was_event = false;
+
+sorted_peak = NaN(nt,1);
+n_sorted    = 0;
+
+FLOOR_FRAC   = 10^(DB_FLOOR_BAND/10);
+punish_chain = 0;
+
+if TIMING_ON, t_ridge = tic; end
+for tt = 1:nt
+    pcol = P(:,tt);
+    pmax = max(pcol) + eps;
+
+    if n_sorted == 0
+        base_p = pmax;
+    else
+        base_p = median_sorted(sorted_peak, n_sorted);
+    end
+    is_event = (pmax > K_EVENT * base_p);
+
+    % score por área acima do floor (em potência normalizada)
+    pnorm      = pcol / pmax;
+    excess_lin = max(pnorm - FLOOR_FRAC, 0);
+    c = [0; cumsum(excess_lin .* df)];
+    score_area = c(end_idx+1) - c(1:nb);
+    scoreN = score_area / (max(score_area) + eps);
+
+    % pico local dentro da banda [i .. end_idx(i)]
+    Pseg = pcol(IDX_safe);
+    Pseg(IDX==0) = -Inf;
+    [~, krel] = max(Pseg, [], 2);
+    lin = sub2ind(size(IDX), (1:nb)', krel);
+    kpeak = double(IDX(lin));
+    fpeak = f_bin(kpeak);
+
+    lambda_eff = RIDGE_LAMBDA;
+    if is_event, lambda_eff = 0; end
+
+    prev_for_punish = prev_f_normal;
+    if (~is_event) && prev_was_event, prev_for_punish = NaN; end
+
+    score_total = scoreN;
+    if (tt > burnin_frames) && ~isnan(prev_for_punish) && (lambda_eff > 0)
+        k_used = min(PUNISH_CHAIN_MAX, punish_chain);
+        lambda_chain_used = lambda_eff * exp(-PUNISH_CHAIN_GAMMA * k_used);
+
+        jump = (fpeak - prev_for_punish) / (F_JUMP_HZ + eps);
+        score_total = score_total - lambda_chain_used * (jump.^2);
+    end
+
+    [~, i_best] = max(score_total);
+    imax(tt) = int32(kpeak(i_best));
+
+    p_peak = pcol(imax(tt));
+    if ~is_event
+        prev_f_normal = f_bin(imax(tt));
+        [sorted_peak, n_sorted] = sorted_insert(sorted_peak, n_sorted, p_peak);
+    end
+
+    if (~is_event) && ~isnan(prev_for_punish)
+        % se o punish realmente "mudou" a escolha, incrementa cadeia
+        [~, i_best_area] = max(scoreN);
+        if i_best ~= i_best_area
+            punish_chain = min(PUNISH_CHAIN_MAX, punish_chain + 1);
+        else
+            punish_chain = 0;
+        end
+    else
+        punish_chain = 0;
+    end
+
+    prev_was_event = is_event;
+end
+if TIMING_ON, fprintf('[T] ridge: %.3fs | nt=%d nb=%d\n', toc(t_ridge), nt, nb); end
+
+freq_hz  = f_bin(double(imax));
+freq_bpm = 60*freq_hz;
+
+%% ===================== SCALOGRAMA (dB) =====================
+Pmax = max(P(:)) + eps;
+Sdb  = 10*log10(P/Pmax + eps);
+Sdb(Sdb < DB_FLOOR_PLOT) = NaN;
+
+%% ===================== GABARITO ECG + MÉTRICAS =====================
+[hr_ref_bpm, ~] = hr_gabarito_from_ecg(INPUT_PATH, t, ECG_MIN_DIST_SEC, ECG_MIN_PROM, HR_MIN_BPM_ECG, HR_MAX_BPM_ECG);
+
+if ~isempty(hr_ref_bpm)
+    ok = isfinite(freq_bpm) & isfinite(hr_ref_bpm);
+    est = freq_bpm(ok); ref = hr_ref_bpm(ok);
+
+    err  = est - ref;
+    RMSE = sqrt(mean(err.^2));
+    MAE  = mean(abs(err));
+    if numel(est) >= 3
+        C = corrcoef(est, ref);
+        CORR = C(1,2);
+    else
+        CORR = NaN;
+    end
+
+    fprintf('\n=== MÉTRICAS (ridge vs ECG) ===\n');
+    fprintf('RMSE=%.3f | MAE=%.3f | CORR=%.4f\n', RMSE, MAE, CORR);
+else
+    warning('Sem gabarito ECG (tfm_ecg1/fs_ecg) neste arquivo.');
+end
+
+%% ===================== MOVMEAN 7s + MÉTRICAS =====================
+WIN_MEAN_SEC = 7;
+winS = max(1, round(WIN_MEAN_SEC * srate));
+
+freq_bpm_smooth = movmean(freq_bpm, winS, 'Endpoints','shrink');
+
+if ~isempty(hr_ref_bpm)
+    hr_ref_bpm_smooth = movmean(hr_ref_bpm, winS, 'Endpoints','shrink');
+
+    okS = isfinite(freq_bpm_smooth) & isfinite(hr_ref_bpm_smooth);
+    estS = freq_bpm_smooth(okS); refS = hr_ref_bpm_smooth(okS);
+
+    RMSE_sm = sqrt(mean((estS-refS).^2));
+    MAE_sm  = mean(abs(estS-refS));
+    CORR_sm = corr(estS, refS, 'Rows','complete');
+
+    fprintf('\n=== MOVMEAN %.1fs (win=%d) ===\n', WIN_MEAN_SEC, winS);
+    fprintf('SMOOTH-> RMSE=%.3f | MAE=%.3f | CORR=%.4f\n', RMSE_sm, MAE_sm, CORR_sm);
+else
+    hr_ref_bpm_smooth = [];
+end
+
+%% ===================== PLOT: scalograma + ridge + ECG =====================
+figure('Name', sprintf('%s | CWT + Ridge', baseName), 'Color','w');
+
+hImg = imagesc(t, f_bin, Sdb);
+set(hImg, 'AlphaData', isfinite(Sdb));
+axis xy; grid on;
+xlabel('t (s)'); ylabel('Freq (Hz)');
+title(sprintf('Scalograma (dB) + Ridge | GATE=%d | BP[%g..%g]Hz', GATE_ON, BP_WI, BP_WF));
+cb = colorbar; ylabel(cb,'dB (rel.)');
+caxis([DB_FLOOR_PLOT 0]); hold on;
+
+yyaxis right;
+plot(t, freq_bpm, 'w', 'LineWidth', 1.8);
+plot(t, freq_bpm, 'k', 'LineWidth', 0.8);
+
+if ~isempty(hr_ref_bpm)
+    plot(t, hr_ref_bpm, 'c--', 'LineWidth', 1.2);
+    plot(t, hr_ref_bpm_smooth, 'c-', 'LineWidth', 1.8);
+    ylabel('HR (bpm)');
+    legend({'','Ridge','', 'ECG raw','ECG movmean'}, 'Location','best');
+else
+    ylabel('HR (bpm)');
+    legend({'','Ridge',''}, 'Location','best');
+end
+
+%% ===================== PLOT: HR movmean vs ECG =====================
+figure('Name', sprintf('HR: movmean %.1fs vs ECG', WIN_MEAN_SEC), 'Color','w');
+plot(t, freq_bpm_smooth, 'LineWidth', 2.0); hold on;
+
+if ~isempty(hr_ref_bpm)
+    plot(t, hr_ref_bpm,        '--', 'LineWidth', 1.2);
+    plot(t, hr_ref_bpm_smooth, '--', 'LineWidth', 2.0);
+    legend(sprintf('Radar movmean %.1fs', WIN_MEAN_SEC), ...
+           'ECG raw', sprintf('ECG movmean %.1fs', WIN_MEAN_SEC), ...
+           'Location','best');
+else
+    legend(sprintf('Radar movmean %.1fs', WIN_MEAN_SEC), 'Location','best');
+end
+grid on; xlabel('t (s)'); ylabel('HR (bpm)');
+title(sprintf('%s | movmean %.1fs | GATE=%d', baseName, WIN_MEAN_SEC, GATE_ON));
+
+if TIMING_ON
+    fprintf('[T] TOTAL: %.3fs\n', toc(t_global));
+end
+
+%% ===================== FUNÇÕES =====================
+function y = sosfiltfilt_compat(sos, g, x)
+    x = x(:);
+    if exist('sosfiltfilt','file') == 2
+        y = sosfiltfilt(sos, g, x);
+        return;
+    end
+    y = x;
+    nsec = size(sos,1);
+    for s = 1:nsec
+        b = sos(s,1:3);
+        a = sos(s,4:6);
+        y = filtfilt(b, a, y);
+    end
+    y = g * y;
+end
+
+function m = max_sos_mag(sos, g, Fs)
+    Nw = 4096;
+    if exist('sosfreqz','file') == 2
+        H = sosfreqz(sos, Nw, Fs);
+        m = max(abs(H)) * abs(g);
+    else
+        [b,a] = sos2tf(sos, g);
+        H = freqz(b, a, Nw, Fs);
+        m = max(abs(H));
+    end
+    if ~isfinite(m) || m <= 0, m = 1; end
+end
+
+function [tpuro_ms, heart, baseName] = load_phase_for_algorithm(path_in)
+    [~, baseName, ext] = fileparts(path_in);
+    ext = lower(ext);
+
+    if ~strcmp(ext,'.mat') && ~strcmp(ext,'.csv')
+        error('Entrada inválida: use .csv ou .mat.');
+    end
+
+    if strcmp(ext,'.csv')
+        data = readmatrix(path_in);
+        tpuro_ms = data(:,1);
+        phase    = data(:,3);
+        heart    = wrap_phase(phase);
+        return;
+    end
+
+    S = load(path_in);
+
+    mode = 'radar';
+    if evalin('base','exist(''INPUT_MODE'',''var'')')
+        mode = lower(string(evalin('base','INPUT_MODE')));
+    end
+
+    switch mode
+        case "ecg1"
+            if ~(isfield(S,'tfm_ecg1') && isfield(S,'fs_ecg'))
+                error('INPUT_MODE=ecg1, mas faltam tfm_ecg1/fs_ecg no MAT.');
+            end
+            x  = double(S.tfm_ecg1(:));
+            fs = double(S.fs_ecg);
+
+        case "ecg2"
+            if ~(isfield(S,'tfm_ecg2') && isfield(S,'fs_ecg'))
+                error('INPUT_MODE=ecg2, mas faltam tfm_ecg2/fs_ecg no MAT.');
+            end
+            x  = double(S.tfm_ecg2(:));
+            fs = double(S.fs_ecg);
+
+        otherwise
+            if ~(isfield(S,'radar_i') && isfield(S,'radar_q') && isfield(S,'fs_radar'))
+                error('INPUT_MODE=radar, mas faltam radar_i/radar_q/fs_radar no MAT.');
+            end
+            I  = double(S.radar_i(:));
+            Q  = double(S.radar_q(:));
+            fs = double(S.fs_radar);
+
+            phase = unwrap(atan2(Q, I));
+            heart = wrap_phase(phase);
+
+            tpuro_ms = ((0:numel(I)-1)'/fs) * 1000;
+            return;
+    end
+
+    tpuro_ms = ((0:numel(x)-1)'/fs) * 1000;
+    heart = wrap_phase(unwrap(x));
+end
+
+function ph_wrapped = wrap_phase(ph)
+    ph = ph(:);
+    ok = isfinite(ph);
+    if ~all(ok)
+        ph(~ok) = interp1(find(ok), ph(ok), find(~ok), 'linear', 'extrap');
+    end
+    ph_wrapped = mod(ph + pi, 2*pi) - pi;
+    ph_wrapped = ph_wrapped - mean(ph_wrapped,'omitnan');
+end
+
+function [f, P1] = psd_one_sided(x, Fs)
+    x = x(:);
+    x = x - mean(x,'omitnan');
+    N = numel(x);
+    NFFT = 2^nextpow2(N);
+
+    X = fft(x, NFFT);
+    P2 = (abs(X)/N).^2;
+
+    P1 = P2(1:NFFT/2+1);
+    if numel(P1) > 2
+        P1(2:end-1) = 2*P1(2:end-1);
+    end
+
+    f = (0:NFFT/2)' * (Fs/NFFT);
+end
+
+function [xatt, dbg] = gate_by_power_hr(x, FS, HR_MIN_BPM, HR_MAX_BPM, DELTA_DB, SMOOTH_BINS, GATE_FLOOR)
+    x = x(:);
+    N = numel(x);
+
+    X = fft(x);
+
+    k = (0:N-1).';
+    f = k*(FS/N);
+    f_abs = min(f, FS - f);
+    bpm_full = 60*f_abs;
+
+    P2   = abs(X).^2;
+    Pref = max(P2) + eps;
+    Pdb_raw = 10*log10(P2/Pref + eps);
+
+    if SMOOTH_BINS > 1
+        Pdb_s = movmean(Pdb_raw, SMOOTH_BINS, 'omitnan');
+    else
+        Pdb_s = Pdb_raw;
+    end
+
+    mHR = (bpm_full >= HR_MIN_BPM) & (bpm_full <= HR_MAX_BPM);
+    if ~any(mHR)
+        xatt = x;
+        dbg = struct('Pdb_hr_peak',NaN,'Pdb_thr',NaN);
+        return;
+    end
+
+    Pdb_hr_peak = max(Pdb_s(mHR), [], 'omitnan');
+    thr = Pdb_hr_peak + DELTA_DB;
+
+    mask = (~mHR) & (Pdb_s > thr);
+
+    W = ones(N,1);
+    W(mask) = GATE_FLOOR;
+    W(mHR)  = 1;
+
+    if SMOOTH_BINS > 1
+        W = movmean(W, SMOOTH_BINS, 'omitnan');
+        W = min(1, max(GATE_FLOOR, W));
+        W(mHR) = 1;
+    end
+
+    xatt = real(ifft(X .* W, 'symmetric'));
+
+    dbg.Pdb_hr_peak = Pdb_hr_peak;
+    dbg.Pdb_thr     = thr;
+end
+
+function [hr_ref_bpm, dbg] = hr_gabarito_from_ecg(path_in, t_radar, minDistSec, minProm, hrMin, hrMax)
+    dbg = struct('n_peaks',0);
+
+    if ~endsWith(lower(path_in), '.mat')
+        hr_ref_bpm = [];
+        return;
+    end
+
+    S = load(path_in);
+    if ~(isfield(S,'tfm_ecg1') && isfield(S,'fs_ecg'))
+        hr_ref_bpm = [];
+        return;
+    end
+
+    ecg = double(S.tfm_ecg1(:));
+    fs  = double(S.fs_ecg);
+    if isempty(ecg) || ~isfinite(fs) || fs <= 0
+        hr_ref_bpm = [];
+        return;
+    end
+
+    w_baseline = max(3, round(0.20 * fs));
+    ecg0 = ecg - movmedian(ecg, w_baseline, 'Endpoints','shrink');
+
+    f1 = 5; f2 = 25;
+    if f2 >= fs/2, f2 = 0.9*(fs/2); end
+    if f1 <= 0 || f1 >= f2
+        hr_ref_bpm = NaN(size(t_radar));
+        return;
+    end
+
+    [b,a] = butter(2, [f1 f2]/(fs/2), 'bandpass');
+    ecg_f = filtfilt(b,a, ecg0);
+    ecg_f = ecg_f / (mad(ecg_f,1) + eps);
+
+    d = [0; diff(ecg_f)];
+    d = d / (mad(d,1) + eps);
+    mwi = movmean(d.^2, max(3, round(0.12*fs)), 'Endpoints','shrink');
+
+    thr = median(mwi) + 3.0*mad(mwi,1);
+    minDistSec2 = max(minDistSec, 60/hrMax);
+    minDistSmp  = max(1, round(minDistSec2 * fs));
+    prom_adapt  = max(minProm, 1.5*mad(mwi,1));
+
+    [~, locs_env] = findpeaks(mwi, ...
+        'MinPeakDistance',  minDistSmp, ...
+        'MinPeakHeight',    thr, ...
+        'MinPeakProminence',prom_adapt);
+
+    dbg.n_peaks = numel(locs_env);
+    if dbg.n_peaks < 3
+        hr_ref_bpm = NaN(size(t_radar));
+        return;
+    end
+
+    w_ref = max(1, round(0.08 * fs));
+    locs_R = zeros(size(locs_env));
+    n = numel(ecg_f);
+
+    for k = 1:numel(locs_env)
+        c0 = locs_env(k);
+        i1 = max(1, c0 - w_ref);
+        i2 = min(n, c0 + w_ref);
+        [~, im] = max(abs(ecg_f(i1:i2)));
+        locs_R(k) = i1 + im - 1;
+    end
+
+    locs_R = unique(locs_R, 'stable');
+    dbg.n_peaks = numel(locs_R);
+    if dbg.n_peaks < 3
+        hr_ref_bpm = NaN(size(t_radar));
+        return;
+    end
+
+    t_ecg = (0:numel(ecg_f)-1)'/fs;
+    t_R   = t_ecg(locs_R);
+
+    RR = diff(t_R);
+    if isempty(RR)
+        hr_ref_bpm = NaN(size(t_radar));
+        return;
+    end
+
+    hr_inst = 60 ./ RR;
+    t_hr = t_R(1:end-1) + RR/2;
+
+    ok = isfinite(hr_inst) & isfinite(t_hr) & (hr_inst >= hrMin) & (hr_inst <= hrMax);
+
+    RR_ok = RR(ok);
+    if numel(RR_ok) >= 5
+        medRR = median(RR_ok);
+        ok = ok & (RR > 0.5*medRR) & (RR < 1.8*medRR);
+    end
+
+    t_hr    = t_hr(ok);
+    hr_inst = hr_inst(ok);
+
+    if numel(hr_inst) < 3
+        hr_ref_bpm = NaN(size(t_radar));
+        return;
+    end
+
+    hr_ref_bpm = interp1(t_hr, hr_inst, t_radar, 'linear', 'extrap');
+end
+
+function m = median_sorted(a, n)
+    if n <= 0, m = NaN; return; end
+    if mod(n,2)==1
+        m = a((n+1)/2);
+    else
+        m = 0.5*(a(n/2) + a(n/2 + 1));
+    end
+end
+
+function [a, n] = sorted_insert(a, n, x)
+    if ~isfinite(x), return; end
+    if n == 0
+        a(1) = x; n = 1; return;
+    end
+    lo = 1; hi = n;
+    while lo <= hi
+        mid = floor((lo+hi)/2);
+        if x < a(mid), hi = mid - 1; else, lo = mid + 1; end
+    end
+    idx = lo;
+    if idx <= n
+        a(idx+1:n+1) = a(idx:n);
+    end
+    a(idx) = x;
+    n = n + 1;
+end

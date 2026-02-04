@@ -1,239 +1,324 @@
 clc; clear; close all;
 
-%% ========================== PATH ==========================
-phases_path = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\phase.csv';
+%% ===================== PARÂMETROS CONFIGURÁVEIS ===================== %%
+CSV_PATH  = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\phases.csv';
+POLAR_HR_PATH = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\POLARH2.txt';  % <<<< ADICIONADO
 
-%% ========================== LEITURA ==========================
-data   = readmatrix(phases_path,'CommentStyle', '#', 'Delimiter', ',');
-tpuro  = data(:,1);      % tempo bruto (ms)
-total  = data(:,2);
-breath = data(:,3);
-heart  = data(:,4);
-heart = unwrap(heart);
-%% ========================== NORMALIZAÇÃO DE FASE ==========================
-% limite a fase para [-pi, +pi] sem alterar FFT, só para corrigir wraps muito grandes
-breath = mod(breath + pi, 2*pi) - pi;
-heart  = mod(heart  + pi, 2*pi) - pi;
+COL_T_MS  = 1;
+COL_HEART = 4;
 
-% tempo em segundos começando em zero
+gap_thr = 0.5;   % limiar de buraco (s)
+
+% ------------------ CWT (compatível) ------------------
+WAVELET        = 'morse';   % mais compatível com versões antigas
+VOICES_PER_OCT = 48;       % 12/16/24/32
+
+% ------------------ Ridge com continuidade em Hz -----------------------
+% Score = Pnorm(:,t) - LAMBDA_HZ2 * (f - f_prev)^2
+RIDGE_LAMBDA_HZ2 = 500;      % 10, 40, 100, 250...
+
+% ------------------ Correção de harmônico (2x) -------------------------
+HARM_RATIO = 0.8;          % se energia em f/2 >= ratio*energia em f => troca pra f/2
+
+% ------------------ Suavização temporal (sem cutoffs em Hz) ------------
+MEDIAN_SMOOTH_SEC = 0;      % mediana móvel (mata spikes)
+MEAN_SMOOTH_SEC   = 1.0;  % média móvel (alisa a curva)
+
+FILL_NAN_WITHIN_SEG = true;
+
+% ------------------ Comparação com Polar -------------------------------
+DO_POLAR_COMPARE = true;
+DT_GRID          = 0.1;     % igual aos outros
+IGNORE_START_SEC = 0;       % igual aos outros
+
+% ------------------ Plot ----------------------------------------------
+PLOT_HR = true;
+
+%% ========================== LEITURA ========================== %%
+if ~isfile(CSV_PATH)
+    error('CSV não encontrado: %s', CSV_PATH);
+end
+
+data  = readmatrix(CSV_PATH);
+if size(data,2) < max(COL_T_MS, COL_HEART)
+    error('CSV tem %d colunas; COL_T_MS=%d, COL_HEART=%d.', size(data,2), COL_T_MS, COL_HEART);
+end
+
+tpuro = data(:,COL_T_MS);
+heart = data(:,COL_HEART);
+
 t  = (tpuro - tpuro(1)) / 1000;
 nt = numel(t);
-srate = 1/mean(diff(t));
 
-%% ========================== PARÂMETROS FFT ==========================
-N       = 128;
-Nmin    = N/4;
-overlap = 0.99;
-hop     = max(1, round(N*(1-overlap)));
+fprintf('CSV OK: %d linhas | t(1)=%.0f ms | heart(1)=%.6f\n', size(data,1), tpuro(1), heart(1));
 
-gap_thr = 0.5;
+%% ==================== SEGMENTAÇÃO POR BURACOS ==================== %%
+dt_all   = diff(t);
+break_ix = find(dt_all > gap_thr);
 
-% filtros
-br_low  = 0.10;
-br_high = 0.50;
-h_low   = 0.80;
-h_high  = 2.50;
+if isempty(break_ix)
+    seg_starts = 1;
+    seg_ends   = nt;
+else
+    seg_starts = [1; break_ix + 1];
+    seg_ends   = [break_ix; nt];
+end
+nSeg = numel(seg_starts);
 
-%% ========================== SEGMENTAÇÃO ==========================
-dt      = diff(t);
-gap_idx = find(dt > gap_thr);
+%% ====== dt e srate NOMINAIS (referência global) ======
+dt_good = dt_all(dt_all > 0 & dt_all <= gap_thr);
+if isempty(dt_good)
+    dt = mean(dt_all(dt_all > 0));
+else
+    dt = mean(dt_good);
+end
+srate_nom = 1/dt;
 
-seg_start = [1; gap_idx+1];
-seg_end   = [gap_idx; nt];
-numSeg    = numel(seg_start);
+%% ======================================================================
+%% ===================== HR via CWT ridge (POR SEGMENTO) =================
+%% ======================================================================
 
-%% ========================== ACUMULADORES ==========================
-sum_freq_br = zeros(size(t));
-sum_w_br    = zeros(size(t));
-sum_freq_h  = zeros(size(t));
-sum_w_h     = zeros(size(t));
+hr_hz_raw  = nan(nt,1);
+hr_bpm_raw = nan(nt,1);
 
-t_window       = [];
-freq_h_window  = [];
-freq_br_window = [];
+for s = 1:nSeg
+    idx_seg = seg_starts(s):seg_ends(s);
+    L = numel(idx_seg);
+    if L < 64, continue; end
 
-%% ========================== LOOP DE FFT ==========================
-for s = 1:numSeg
-    
-    i1 = seg_start(s);
-    i2 = seg_end(s);
-    L  = i2 - i1 + 1;
-    if L < Nmin, continue; end
-    
-    first_end = i1 + Nmin - 1;
-    if first_end > i2, continue; end
-    
-    last_start = [];
-    
-    for g_end = first_end : hop : i2
+    t_seg = t(idx_seg);
+    x_seg = heart(idx_seg);
+
+    dt_seg = diff(t_seg);
+    if any(dt_seg <= 0), continue; end
+    fs = 1/mean(dt_seg);
+
+    % remove DC (sem filtros)
+    x_seg = x_seg - mean(x_seg);
+
+    % --------- CWT compatível ---------
+    [wt,f] = cwt(x_seg, fs, WAVELET, 'VoicesPerOctave',VOICES_PER_OCT);
+    f = f(:);
+    [f, ord] = sort(f,'ascend');
+    wt = wt(ord,:);
+
+    P = abs(wt).^2;                 % nF x L
+    if isempty(P) || size(P,2) ~= L, continue; end
+
+    % evita DC: zera apenas o 1º bin (sem cutoff em Hz)
+    P(1,:) = 0;
+
+    % --------- NORMALIZA por coluna ---------
+    Pnorm = P ./ (max(P,[],1) + eps);
+
+    % --------- ridge com continuidade em HZ ------------
+    ridge_f = ridge_track_continuity_hz(Pnorm, f, RIDGE_LAMBDA_HZ2);
+
+    % --------- correção de harmônico 2x ----------------
+    ridge_f = harmonic_fix_half(P, f, ridge_f, HARM_RATIO);
+
+    hr_hz  = ridge_f(:);
+    hr_bpm = 60 * hr_hz;
+
+    % salva bruto
+    hr_hz_raw(idx_seg)  = hr_hz;
+    hr_bpm_raw(idx_seg) = hr_bpm;
+
+    % --------- suavização dentro do segmento -----------
+    wMed = max(3, round(MEDIAN_SMOOTH_SEC * fs));
+    wMean= max(3, round(MEAN_SMOOTH_SEC   * fs));
+
+    tmp = hr_bpm_raw(idx_seg);
+
+    tmp = movmedian(tmp, wMed, 'omitnan');
+
+    if FILL_NAN_WITHIN_SEG
+        tmp = fill_nan_by_interp(t_seg, tmp);
+    end
+
+    tmp = movmean(tmp, wMean, 'omitnan');
+
+    hr_bpm_raw(idx_seg) = tmp;
+end
+
+%% ===================== FINAL =====================
+hr_bpm_final = hr_bpm_raw;  % já suavizado por segmento
+
+%% ===================== COMPARAÇÃO COM POLAR (IGUAL AOS OUTROS) =====================
+if DO_POLAR_COMPARE
+    if ~isfile(POLAR_HR_PATH)
+        warning('Polar não encontrado: %s (pulando comparação)', POLAR_HR_PATH);
+    else
+        [t_polar, HR_polar] = read_txt_polar(POLAR_HR_PATH);
         
-        g_start = max(i1, g_end - (N-1));
-        idx_raw = g_start:g_end;
-        Lraw    = numel(idx_raw);
-        if Lraw < Nmin, continue; end
-        
-        p = floor(log2(Lraw));
-        M = 2^p;
-        if M < Nmin, continue; end
-        
-        if Lraw == M
-            start2 = g_start;
-            end2   = g_end;
+        % remove duplicatas
+        [t_polar, ia] = unique(t_polar, 'stable');
+        HR_polar = HR_polar(ia);
+
+        HR_polar_mean = mean(HR_polar, 'omitnan');
+        fprintf('HR Polar médio: %.4f bpm | f média: %.6f Hz\n', HR_polar_mean, HR_polar_mean/60);
+
+        t_radar  = t;
+        HR_radar = hr_bpm_final;
+
+        okR = isfinite(t_radar) & isfinite(HR_radar);
+        okP = isfinite(t_polar) & isfinite(HR_polar);
+
+        if nnz(okR) < 2 || nnz(okP) < 2
+            warning('Poucos pontos válidos Radar x Polar (radar=%d, polar=%d).', nnz(okR), nnz(okP));
         else
-            mid = round((g_start + g_end)/2);
-            start2 = mid - floor((M-1)/2);
-            end2   = start2 + M - 1;
-            if start2 < i1, start2 = i1; end
-            if end2 > i2, end2 = i2; start2 = end2 - M + 1; end
-        end
-        
-        if start2 < i1 || end2 > i2 || (end2-start2+1)~=M
-            continue;
-        end
-        
-        if ~isempty(last_start) && start2 <= last_start
-            hopM = max(1, round(M*(1-overlap)));
-            new_start2 = last_start + hopM;
-            new_end2   = new_start2 + M - 1;
-            if new_end2 > i2, continue; end
-            start2 = new_start2;
-            end2   = new_end2;
-        end
-        
-        last_start = start2;
-        
-        idx    = start2:end2;
-        t_win  = t(idx);
-        br_raw = breath(idx);
-        h_raw  = heart(idx);
-        
-        dt_win = diff(t_win);
-        if any(dt_win <= 0) || any(isnan(dt_win)), continue; end
-        
-        fs = 1/mean(dt_win);
-        
-        % filtros
-        if fs > 2*br_high
-            [b,a] = butter(4,[br_low br_high]/(fs/2));
-            br_win = filtfilt(b,a,br_raw);
-        else
-            br_win = br_raw;
-        end
-        
-        if fs > 2*h_high
-            [b,a] = butter(4,[h_low h_high]/(fs/2));
-            h_win = filtfilt(b,a,h_raw);
-        else
-            h_win = h_raw;
-        end
-        
-        % -------- FFT --------
-        % %%% VERSÃO ANTIGA (CORTAVA METADE)
-        % Br       = fft(br_win);
-        % H        = fft(h_win);
-        % nFFT     = numel(br_win);
-        % half_fft = floor(nFFT/2);
-        % f_axis   = (0:half_fft-1) * fs / nFFT;
-        % [~,kbr] = max(abs(Br(1:half_fft)));
-        % [~,kh ] = max(abs(H(1:half_fft)));
-        % fbr_hz = f_axis(kbr);
-        % fh_hz  = f_axis(kh);
-        
-        % %%% ALTERADO AQUI: usa espectro completo, sem cortar "frequência negativa"
-        Br   = fft(br_win);
-        H    = fft(h_win);
-        nFFT = numel(br_win);
-        f_axis = (0:nFFT-1) * fs / nFFT;   % eixo 0..(fs-df)
+            t_start = max(t_radar(find(okR,1,'first')), t_polar(find(okP,1,'first')));
+            t_end   = min(t_radar(find(okR,1,'last')),  t_polar(find(okP,1,'last')));
 
-        [~,kbr] = max(abs(Br));            % pico em todo o espectro
-        [~,kh ] = max(abs(H));
+            if ~(isfinite(t_start) && isfinite(t_end)) || (t_end <= t_start)
+                warning('Sem interseção de tempo válida entre Radar e Polar.');
+            else
+                t_common = (t_start : DT_GRID : t_end)';
 
-        fbr_hz = f_axis(kbr);
-        fh_hz  = f_axis(kh);
-        
-        % salvar
-        t_window(end+1,1)       = mean(t_win);
-        freq_br_window(end+1,1) = fbr_hz*60;
-        freq_h_window(end+1,1)  = fh_hz*60;
-        
-        % acumular
-        sum_freq_br(idx) = sum_freq_br(idx) + fbr_hz;
-        sum_w_br(idx)    = sum_w_br(idx) + 1;
-        sum_freq_h(idx)  = sum_freq_h(idx) + fh_hz;
-        sum_w_h(idx)     = sum_w_h(idx) + 1;
+                HR_radar_grid = interp1(t_radar(okR), HR_radar(okR), t_common, 'linear');
+                HR_polar_grid = interp1(t_polar(okP), HR_polar(okP), t_common, 'linear');
+
+                mask_time = (t_common >= (t_start + IGNORE_START_SEC));
+
+                HR_ref  = HR_polar_grid(mask_time);
+                HR_test = HR_radar_grid(mask_time);
+
+                err = HR_test - HR_ref;
+
+                MAE  = mean(abs(err), 'omitnan');
+                RMSE = sqrt(mean(err.^2, 'omitnan'));
+                R    = corr(HR_test, HR_ref, 'rows', 'complete');
+
+                fprintf('\n=== Radar x Polar (dt_grid=%.2fs | ignore=%.1fs) ===\n', DT_GRID, IGNORE_START_SEC);
+                fprintf('MAE : %.4f bpm\n', MAE);
+                fprintf('RMSE: %.4f bpm\n', RMSE);
+                fprintf('Corr: %.4f\n', R);
+            end
+        end
     end
 end
 
-%% ========================== FREQ BRUTA POR AMOSTRA ==========================
-freq_br = nan(size(t));
-freq_h  = nan(size(t));
+%% ===================== PLOT FINAL =====================
+if PLOT_HR
+    figure('Color','w');
+    plot(t, hr_bpm_final, 'k', 'LineWidth', 1.4); hold on;
+    grid on;
+    xlabel('Tempo (s)');
+    ylabel('HR (bpm)');
+    title(sprintf('HEART | HR via CWT ridge (contínuo) | srate_nom=%.2f Hz | nSeg=%d', srate_nom, nSeg));
 
-mask_br = sum_w_br > 0;
-mask_h  = sum_w_h  > 0;
+    % overlay Polar (se existir)
+    if DO_POLAR_COMPARE && isfile(POLAR_HR_PATH)
+        [t_polar, HR_polar] = read_txt_polar(POLAR_HR_PATH);
+        [t_polar, ia] = unique(t_polar, 'stable');
+        HR_polar = HR_polar(ia);
+        plot(t_polar, HR_polar, 'm.-', 'LineWidth', 1, 'MarkerSize', 8);
+        legend('Radar (final)', 'Polar', 'Location','best');
+    else
+        legend('Radar (final)', 'Location','best');
+    end
+end
 
-freq_br(mask_br) = sum_freq_br(mask_br)./sum_w_br(mask_br);
-freq_h(mask_h)   = sum_freq_h(mask_h)./sum_w_h(mask_h);
+%% ===================== (SEM SAVE) =====================
+% Você pediu "sem save nenhum", então removi o save().
 
-freq_br = freq_br*60;
-freq_h  = freq_h*60;
+%% ===================== FUNÇÕES LOCAIS =====================
+function [cfs,f] = get_cwt_compat(x, fs, wname, vpo)
+    L = numel(x);
 
-%% ========================== CURVA CONTÍNUA GLOBAL ==========================
-valid_h  = ~isnan(freq_h);
-valid_br = ~isnan(freq_br);
+    if exist('cwtfilterbank','file')
+        try
+            fb = cwtfilterbank('SignalLength', L, ...
+                               'SamplingFrequency', fs, ...
+                               'VoicesPerOctave', vpo, ...
+                               'Wavelet', wname);
+        catch
+            fb = cwtfilterbank('SignalLength', L, ...
+                               'SamplingFrequency', fs, ...
+                               'VoicesPerOctave', vpo, ...
+                               'Wavelet', 'morse');
+        end
 
-freq_h_cont  = interp1(t(valid_h),  freq_h(valid_h),  t, 'pchip', 'extrap');
-freq_br_cont = interp1(t(valid_br), freq_br(valid_br), t, 'pchip', 'extrap');
+        try
+            [cfs,f] = cwt(fb, x); return;
+        catch
+        end
+        try
+            [cfs,f] = cwt(x, 'FilterBank', fb); return;
+        catch
+        end
+        try
+            [cfs,f] = fb.cwt(x); return;
+        catch
+        end
 
-%% ========================== SUAVIZAÇÃO GAUSSIANA (O QUE VOCÊ ESTAVA FAZENDO) ==========================
-h = 2;
-n = length(t);
-t_deslocado = t - t(floor((n+1)/2));
+        error('cwtfilterbank existe, mas não encontrei forma compatível de aplicar a CWT.');
+    end
 
-gaus = exp(-4*log(2)*t_deslocado.^2/h^2);
-gaus = gaus/sum(gaus);
+    try
+        [cfs,f] = cwt(x, fs); return;
+    catch
+    end
+    try
+        [cfs,f] = cwt(x, 1/fs); return;
+    catch
+    end
 
-ngaus   = length(gaus);
-nsignal = length(freq_h_cont);
-nConv   = ngaus + nsignal - 1;
-half    = floor(ngaus/2);
+    error('Sem suporte a CWT nesta instalação.');
+end
 
-G = fft(gaus,       nConv);
-S = fft(freq_h_cont,nConv);
-freq_h_new = ifft(G .* S);
+function ridge_f = ridge_track_continuity_hz(Pnorm, f, lambda_hz2)
+    [nF,L] = size(Pnorm);
+    ridge_f = nan(1,L);
 
-freq_h_new = freq_h_new(half+1:end-half);
+    [~, i0] = max(Pnorm(:,1));
+    ridge_f(1) = f(i0);
+    fprev = ridge_f(1);
 
-% ================= AJUSTE PEDIDO =================
-% Se for menor que 60, arredonda para 60 bpm
-freq_h_new(freq_h_new < 60) = 60;
-  % mantém como você colocou
+    for k = 2:L
+        penal = lambda_hz2 * (f - fprev).^2;
+        score = Pnorm(:,k) - penal;
+        [~, ik] = max(score);
+        ridge_f(k) = f(ik);
+        fprev = ridge_f(k);
+    end
+end
 
-%% ========================== MOVMEAN ==========================
-win_smooth = 256;
+function ridge_f = harmonic_fix_half(P, f, ridge_f, ratio)
+    L = size(P,2);
+    for k = 1:L
+        fk = ridge_f(k);
+        if isnan(fk) || fk <= 0, continue; end
+        [~, i1] = min(abs(f - fk));
+        [~, i2] = min(abs(f - fk/2));
+        p1 = P(i1,k);
+        p2 = P(i2,k);
+        if p2 >= ratio * p1
+            ridge_f(k) = fk/2;
+        end
+    end
+end
 
-mean_h_cont  = movmean(freq_h_cont,  win_smooth);
-mean_br_cont = movmean(freq_br_cont, win_smooth);
+function x = fill_nan_by_interp(t, x)
+    ok = ~isnan(x);
+    if nnz(ok) >= 2
+        x(~ok) = interp1(t(ok), x(ok), t(~ok), 'linear', 'extrap');
+    end
+end
 
-%% ========================== PLOTS ESSENCIAIS ==========================
-figure;
-plot(t, freq_h_cont, '-', 'LineWidth', 1.0); hold on;
-plot(t, freq_h_new, 'm');
-plot(t, mean_h_cont, 'r', 'LineWidth', 1.5);
-xlabel('Tempo (s)'); ylabel('HR (bpm)');
-title('HR contínua + gauss + movmean');
-grid on;
+function [t_sec, HR] = read_txt_polar(p)
+    fid = fopen(p,'r');
+    if fid == -1, error('Não foi possível abrir o arquivo Polar: %s', p); end
+    C = textscan(fid,'%s %f %*[^\n]','Delimiter',';','HeaderLines',1);
+    fclose(fid);
 
-figure;
-plot(t, freq_br_cont, '-', 'LineWidth', 1.0); hold on;
-plot(t, mean_br_cont, 'r', 'LineWidth', 1.5);
-xlabel('Tempo (s)'); ylabel('RR (bpm)');
-title('RR contínua + movmean');
-grid on;
-%mean_h_cont = freq_h_new;
-%% ========================== SAVE ==========================
-save('freq_results.mat', 't', ...
-    'freq_h', 'freq_br', ...
-    'freq_h_cont', 'freq_br_cont', ...
-    'mean_h_cont', 'mean_br_cont');
+    ts_str = C{1};
+    HR     = C{2};
 
-save('freq_windows.mat','t_window','freq_h_window','freq_br_window');
+    try
+        t_dt = datetime(ts_str,'InputFormat','yyyy-MM-dd''T''HH:mm:ss.SSS');
+    catch
+        t_dt = datetime(ts_str,'InputFormat','yyyy-MM-dd HH:mm:ss.SSS');
+    end
+    t_sec = seconds(t_dt - t_dt(1));
+end

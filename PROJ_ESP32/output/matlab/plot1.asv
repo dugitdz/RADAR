@@ -45,8 +45,8 @@ FILTER_TYPE_GRID  = ["cheby2"];
 FILTER_ORDER_GRID = [4];                  % (se quiser também testar ord=2, coloca [2 4])
 
 % bandas
-WI_GRID = [0.6 0.80];
-WF_GRID = [2.00 2.50];
+WI_GRID = [0.5 0.80];
+WF_GRID = [2.00 2.50 3.00];
 
 % harmônicos
 HARM_ON_GRID = [0 1];

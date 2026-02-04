@@ -1,340 +1,468 @@
-import tkinter as tk
-from tkinter import ttk
-import threading
-import struct
-import serial
 import numpy as np
-import queue
+import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import csv
-import os
-import datetime
+
+from datetime import datetime
+from fractions import Fraction
+
+from scipy.signal import resample_poly, get_window, butter, filtfilt, spectrogram
+from scipy.interpolate import PchipInterpolator
 
 
+# ===================== CONFIG (EDITÁVEL) ===================== #
+PHASES_PATH   = r"C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\phases.csv"
+POLAR_HR_PATH = r"C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\POLARH2.txt"
 
-# Global variables
-update_time = 100  # Time of update in ms
-decimal_round = 5
-running = False
-flag = 0
-buffer_size = 60    # In seconds
-# serialPort = serial.Serial("COM4", baudrate=1382400, timeout=2)
+# Segmentação por buracos
+GAP_THR_SEC = 0.5
 
-# Buffers for graphs
-heart_phase_values = np.zeros(buffer_size)
-breath_phase_values = np.zeros(buffer_size)
-time_values = np.arange(-buffer_size + 1, 1, 1)
+# alvo de amostragem uniforme
+FS_TARGET = 25.0  # Hz
 
-def initialize_serial():
-    """Initialize the serial port."""
-    global serialPort
+# ===== rFFT por hop =====
+NPERSEG     = 128
+HOP_SAMPLES = NPERSEG // 5     # 80% overlap
+WINDOW      = "hann"
+
+# ===== ZERO-PHASE BANDPASS (filtfilt) =====
+BP_ORDER = 2
+
+# Heart band (Hz)
+HEART_WI_HZ = 0.8
+HEART_WF_HZ = 3.5
+
+# Breath band (Hz)
+BREATH_WI_HZ = 0.10
+BREATH_WF_HZ = 0.60
+
+# Remover DC / muito baixa freq (pra não travar em 0 Hz)
+F_MIN_HZ = 0.05  # Hz
+
+# ===== SUAVIZAÇÃO (em tempo no grid comum) =====
+SMOOTH_HR_SEC = 5.0
+SMOOTH_BR_SEC = 10.0
+
+# ===== GRID COMUM (para interp/plot e movmean em tempo) =====
+DT_GRID = 0.1  # s
+
+# Comparação com Polar (métricas + overlay no espectro)
+DO_POLAR_COMPARE = True
+
+# eps pra log(P) na interp parabólica
+EPS_PWR = 1e-20
+
+
+# ===================== LEITURAS ===================== #
+def read_phases_csv_matlab_style(path):
+    """
+    tpuro  = col 1 (ms)
+    heart  = col 4 (index 3)
+    breath = col 3 (index 2)
+    """
+    data = np.genfromtxt(path, delimiter=",", dtype=np.float64)
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    if data.shape[1] < 4:
+        raise ValueError(f"phases.csv precisa ter >=4 colunas, mas tem {data.shape[1]}")
+    tpuro_ms = data[:, 0]
+    heart    = data[:, 1]
+    breath   = data[:, 2]
+    return tpuro_ms, heart, breath
+
+
+def read_txt_polar(path):
+    df = pd.read_csv(path, sep=";", header=0, usecols=[0, 1])
+    ts_str = df.iloc[:, 0].astype(str).to_list()
+    hr = df.iloc[:, 1].to_numpy(dtype=np.float64)
+
+    t_dt = []
+    for s in ts_str:
+        s = s.strip()
+        try:
+            t_dt.append(datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%f"))
+        except ValueError:
+            t_dt.append(datetime.strptime(s, "%Y-%m-%d %H:%M:%S.%f"))
+
+    t0 = t_dt[0]
+    t_sec = np.array([(x - t0).total_seconds() for x in t_dt], dtype=np.float64)
+
+    # unique estável
+    _, ia = np.unique(t_sec, return_index=True)
+    ia = np.sort(ia)
+    return t_sec[ia], hr[ia]
+
+
+# ===================== UTIL ===================== #
+def segment_by_gaps(t, gap_thr):
+    dt = np.diff(t)
+    breaks = np.where(dt > gap_thr)[0]
+    n = len(t)
+    if breaks.size == 0:
+        return [(0, n - 1)]
+    starts = np.concatenate(([0], breaks + 1))
+    ends   = np.concatenate((breaks, [n - 1]))
+    return list(zip(starts, ends))
+
+
+def _estimate_fs_native(t_seg):
+    dt = np.diff(t_seg)
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    if dt.size < 3:
+        return None
+    fs = 1.0 / np.median(dt)
+    if not np.isfinite(fs) or fs <= 0:
+        return None
+    return fs
+
+
+def resample_poly_from_irregular(t_seg, x_seg, fs_target, fs_native_max_den=1000):
+    """
+    Irregular -> (uniform em fs_native via PCHIP) -> resample_poly -> fs_target.
+    """
+    t_seg = np.asarray(t_seg, dtype=np.float64)
+    x_seg = np.asarray(x_seg, dtype=np.float64)
+
+    if t_seg.size < 6:
+        return None, None
+    if np.any(np.diff(t_seg) <= 0):
+        return None, None
+
+    fs_native = _estimate_fs_native(t_seg)
+    if fs_native is None:
+        return None, None
+
+    t0 = t_seg[0]
+    t1 = t_seg[-1]
+    if t1 <= t0:
+        return None, None
+
+    dt_native = 1.0 / fs_native
+    tu_native = np.arange(t0, t1 + 1e-12, dt_native, dtype=np.float64)
+    if tu_native.size < 8:
+        return None, None
+
     try:
-        serialPort = serial.Serial(
-            port="COM6", baudrate=1382400, bytesize=8, timeout=2, stopbits=serial.STOPBITS_TWO
-        )
-        print("Serial port initialized successfully.")
-    except Exception as e:
-        print(f"Error initializing serial port: {e}")
+        f = PchipInterpolator(t_seg, x_seg, extrapolate=False)
+        xu_native = f(tu_native)
+    except Exception:
+        return None, None
 
-class SerialReaderApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Radar Data Reader")
-        self.queue = queue.Queue()
+    ok = np.isfinite(xu_native)
+    if np.sum(ok) < 8:
+        return None, None
+    tu_native = tu_native[ok]
+    xu_native = xu_native[ok]
 
-        # Innitialize CSV file
-        self.csv_file = None
-        self.csv_writer = None
-        self.csv_filename = None
-        self.previous_timestamp = None
+    xu_native = xu_native - np.mean(xu_native)
+
+    ratio = Fraction(fs_target / fs_native).limit_denominator(fs_native_max_den)
+    up, down = ratio.numerator, ratio.denominator
+    if up <= 0 or down <= 0:
+        return None, None
+
+    xu_target = resample_poly(xu_native, up, down).astype(np.float64)
+    tu_target = t0 + np.arange(xu_target.size, dtype=np.float64) / float(fs_target)
+
+    if xu_target.size < 8:
+        return None, None
+
+    return tu_target, xu_target
 
 
-        # Create the main frame with responsive layout
-        main_frame = ttk.Frame(root)
-        main_frame.grid(row=0, column=0, sticky="nsew")
-        main_frame.columnconfigure(0, weight=3)  # Graphs take 3/4 of the width
-        main_frame.columnconfigure(1, weight=1)  # Labels take 1/4 of the width
-        main_frame.rowconfigure(0, weight=1)
+def zero_phase_bandpass(x, fs, wi_hz, wf_hz, order):
+    x = np.asarray(x, dtype=np.float64)
+    if x.size < 8:
+        return x
 
-        # Left side: Graphs
-        graph_frame = ttk.Frame(main_frame)
-        graph_frame.grid(row=0, column=0, sticky="nsew")
+    nyq = 0.5 * fs
+    wi = float(wi_hz) / nyq
+    wf = float(wf_hz) / nyq
 
-        self.buffer_size = int(buffer_size * 1000 / update_time)
-        global time_values, heart_phase_values, breath_phase_values
-        time_values = np.linspace(-buffer_size, 0, self.buffer_size)
-        heart_phase_values = np.zeros(self.buffer_size)
-        breath_phase_values = np.zeros(self.buffer_size)
+    wi = max(1e-6, min(wi, 0.999999))
+    wf = max(1e-6, min(wf, 0.999999))
+    if wf <= wi:
+        return x
 
-        # Create the graphs
-        self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(6, 5), sharex=True)
-        self.ax1.set_title("Heart Phase", fontsize=10)
-        self.ax1.set_ylim(-8, 8)
-        self.ax1.set_xlim(-buffer_size, 0)
-        self.ax1.grid(True, linestyle='--', alpha=0.5)
-        self.ax2.set_title("Breath Phase", fontsize=10)
-        self.ax2.set_ylim(-8, 8)
-        self.ax2.set_xlabel("Time (seconds)", fontsize=10)
-        self.ax2.set_xlim(-buffer_size, 0)
-        self.ax2.grid(True, linestyle='--', alpha=0.5)
-        self.line1, = self.ax1.plot(time_values, heart_phase_values, "r-", linewidth=1.5)
-        self.line2, = self.ax2.plot(time_values, breath_phase_values, "b-", linewidth=1.5)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=graph_frame)
-        canvas_widget = self.canvas.get_tk_widget()
-        canvas_widget.pack(fill=tk.BOTH, expand=True)
+    b, a = butter(int(order), [wi, wf], btype="bandpass")
 
-        # Right side: Labels (Squares)
-        square_frame = ttk.Frame(main_frame)
-        square_frame.grid(row=0, column=1, sticky="nsew", rowspan=6, padx=10)
-        square_frame.columnconfigure(0, weight=1)
+    padlen = 3 * (max(len(a), len(b)) - 1)
+    if x.size <= padlen:
+        return x
 
-        self.square_labels = []
-        for i, label_text in enumerate(["Heart:", "Breath:", "Total:", "Distance:"]):
-            label = tk.Label(
-                square_frame,
-                bg="#f0f0f0",
-                font=("Arial", 14, "bold"),
-                fg="black",
-                borderwidth=2,
-                relief="solid",
-                width=20,
-                height=3,
-                anchor="center"
-            )
-            label.config(text=f"{label_text}\n0.00000")
-            label.grid(row=i, column=0, pady=5, sticky="ew")
-            self.square_labels.append(label)
+    try:
+        return filtfilt(b, a, x)
+    except Exception:
+        return x
 
-        # Add buttons under the labels
-        square_frame.rowconfigure(4, weight=1)
-        square_frame.rowconfigure(5, weight=1)
 
-        # Start Button (Row 4)
-        self.start_button = tk.Button(
-            square_frame,
-            text="Start Serial",
-            command=self.start_plotting,
-            bg="yellowgreen",
-            activebackground="lightgreen",
-            font=("Arial", 14, "bold"),
-            fg="black",
-            borderwidth=2,
-            relief="solid",
-            width=20,
-            height=3
-        )
-        
-        self.start_button.grid(row=4, column=0, pady=5, sticky="ew")
+def parabolic_peak_interp_logP(P, k):
+    if k <= 0 or k >= (P.size - 1):
+        return 0.0
 
-        # Stop Button (Row 5)
-        self.stop_button = tk.Button(
-            square_frame,
-            text="Stop Serial",
-            command=self.stop_plotting,
-            bg="tomato",
-            activebackground="coral",
-            font=("Arial", 14, "bold"),
-            fg="black",
-            borderwidth=2,
-            relief="solid",
-            width=20,
-            height=3
-        )
-        self.stop_button.grid(row=5, column=0, pady=5, sticky="ew")
-        self.start_button.config(state=tk.NORMAL)
-        self.stop_button.config(state=tk.DISABLED)
+    a0 = float(P[k - 1])
+    b0 = float(P[k])
+    c0 = float(P[k + 1])
 
-        # Log area with scrollbar and auto-scroll
-        log_frame = ttk.Frame(root)
-        log_frame.grid(row=1, column=0, sticky="nsew")
-        log_frame.columnconfigure(0, weight=1)
-        log_frame.rowconfigure(0, weight=1)
+    la = np.log(a0 + EPS_PWR)
+    lb = np.log(b0 + EPS_PWR)
+    lc = np.log(c0 + EPS_PWR)
 
-        self.text_log = tk.Text(log_frame, height=6, state=tk.DISABLED, wrap=tk.NONE)
-        self.text_log.grid(row=0, column=0, sticky="nsew")
-        scrollbar_x = ttk.Scrollbar(log_frame, orient=tk.HORIZONTAL, command=self.text_log.xview)
-        scrollbar_x.grid(row=1, column=0, sticky="ew")
-        scrollbar_y = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.text_log.yview)
-        scrollbar_y.grid(row=0, column=1, sticky="ns")
-        self.text_log.config(xscrollcommand=scrollbar_x.set, yscrollcommand=scrollbar_y.set)
+    denom = (la - 2.0 * lb + lc)
+    if denom == 0 or not np.isfinite(denom):
+        return 0.0
 
-        # Start the serial reading thread
-        self.thread = threading.Thread(target=self.read_serial_thread, daemon=True)
-        self.thread.start()
+    delta = 0.5 * (la - lc) / denom
+    if not np.isfinite(delta):
+        delta = 0.0
+    return float(np.clip(delta, -0.75, 0.75))
 
-        # Start the UI update loop
-        self.update_counter = 0  # Counter to control graph redraw frequency
-        self.update_ui()
 
-    def start_plotting(self):
-        """Start the serial reading process."""
-        global running
-        if not running:
-            running = True
-            self.start_button.config(state=tk.DISABLED)
-            self.stop_button.config(state=tk.NORMAL)
-            print("Starting serial reading...")
+def rfft_fundamental_track_hop(tu, xu, fs, nperseg, hop_samples, window, f_min_hz):
+    xu = np.asarray(xu, dtype=np.float64)
+    tu = np.asarray(tu, dtype=np.float64)
 
-            # Create a new CSV file
-            now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            self.csv_filename = f"radar_data_{now}.csv"
-            self.csv_file = open(self.csv_filename, mode="w", newline="")
-            self.csv_writer = csv.writer(self.csv_file)
-            self.csv_writer.writerow(["Timestamp", "HeartPhase", "BreathPhase", "TotalPhase", "Distance"])
-            self.current_data = {}
+    if xu.size < nperseg or tu.size != xu.size:
+        return None, None
 
-            self.update_ui()
+    hop_samples = int(max(1, hop_samples))
+    nperseg = int(nperseg)
 
-            self.update_ui()
+    win = get_window(window, nperseg, fftbins=True).astype(np.float64)
+    nfft = nperseg
 
-    def stop_plotting(self):
-        global running
-        if running:
-            running = False
-            self.stop_button.config(state=tk.DISABLED)
-            self.start_button.config(state=tk.NORMAL)
-            print("Stopping serial reading...")
+    k_min = int(np.ceil(float(f_min_hz) * nfft / float(fs)))
+    k_min = max(1, k_min)
 
-             # Close the CSV file
-            if self.csv_file:
-                self.csv_file.close()
-                print(f"Data saved to {self.csv_filename}")
-            
-    def read_serial_thread(self):
-        """Read data from the serial port in a separate thread."""
-        global flag, heart_phase_values, breath_phase_values, running
-        while True:
-            try:
-                byte = serialPort.read(1)
-                if byte == b'\x0A':
-                    next_byte = serialPort.read(1)
-                    if next_byte == b'\x14':
-                        flag = 0
-                    elif next_byte == b'\x13':
-                        data = serialPort.read(13)
-                        TotalPhase = struct.unpack('<f', data[1:5])[0]
-                        BreathPhase = struct.unpack('<f', data[5:9])[0]
-                        HeartPhase = struct.unpack('<f', data[9:13])[0]
-                        if running:                            
-                            self.current_data["timestamp"] = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                            self.current_data["HeartPhase"] = HeartPhase
-                            self.current_data["BreathPhase"] = BreathPhase
-                            self.current_data["TotalPhase"] = TotalPhase
-                            self.queue.put({
-                                "type": "data",
-                                "message": f"Breath: {BreathPhase}, Heart: {HeartPhase}, Total: {TotalPhase}\n",
-                                "HeartPhase": HeartPhase,
-                                "BreathPhase": BreathPhase,
-                                "TotalPhase": TotalPhase
-                            })
+    t_frames = []
+    fpk = []
 
-                            # Update the buffers for the graphs
-                            heart_phase_values[:-1] = heart_phase_values[1:]
-                            heart_phase_values[-1] = HeartPhase
-                            breath_phase_values[:-1] = breath_phase_values[1:]
-                            breath_phase_values[-1] = BreathPhase
-                        flag = 1
-                    elif next_byte == b'\x16' and flag == 1:
-                        data = serialPort.read(9)
-                        Distance = struct.unpack('<f', data[5:9])[0]
-                        if running:
-                            self.current_data["Distance"] = Distance
-                            self.queue.put({
-                                "type": "distance",
-                                "message": f"Distance: {Distance}\n",
-                                "Distance": Distance
-                            })
-                            # Write the csv with all the data from the port
-                            if self.csv_writer and all(k in self.current_data for k in ("timestamp", "HeartPhase", "BreathPhase", "TotalPhase", "Distance")):
-                                current_time = datetime.datetime.strptime(self.current_data["timestamp"], "%H:%M:%S.%f")
-                                if self.previous_timestamp is None:
-                                    time_difference = 0.0  # First sample
-                                else:
-                                    time_difference = (current_time - self.previous_timestamp).total_seconds()
-                                self.csv_writer.writerow([
-                                    self.current_data["timestamp"],
-                                    self.current_data["HeartPhase"],
-                                    self.current_data["BreathPhase"],
-                                    self.current_data["TotalPhase"],
-                                    self.current_data["Distance"],
-                                    time_difference
-                                ])
-                                self.previous_timestamp = current_time  # Update last timestamp
-                                self.current_data = {}  # Clear buffer
+    for i0 in range(0, xu.size - nperseg + 1, hop_samples):
+        xw = xu[i0:i0+nperseg] * win
+        X = np.fft.rfft(xw, n=nfft)
+        P = (np.abs(X) ** 2).astype(np.float64)
 
-            except Exception as e:
-                self.queue.put({"type": "error", "message": f"Error reading serial data: {e}\n"})
+        if k_min >= P.size:
+            continue
 
-    def update_ui(self):
-        global running
-        """Update the UI with new data from the queue."""
-        
-        while not self.queue.empty():
-            item = self.queue.get()
-            if item["type"] == "data":
-                if running:
-                    # Update labels
-                    self.update_square_labels(item["HeartPhase"], item["BreathPhase"], item["TotalPhase"], None)
-            elif item["type"] == "distance":
-                if running:
-                    # Update only the distance label
-                    self.square_labels[3].config(text=f"Distance:\n{round(item['Distance'], decimal_round)}")
+        k0 = k_min + int(np.argmax(P[k_min:]))
+        delta = parabolic_peak_interp_logP(P, k0)
+        f_est = (k0 + delta) * fs / nfft
 
-            # Log message (limit log size to 500 lines)
-            self.text_log.config(state=tk.NORMAL)
-            self.text_log.insert(tk.END, item["message"])
-            if float(self.text_log.index('end-1c')) > 500:  # Keep max 500 lines
-                self.text_log.delete("1.0", "2.0")
-            self.text_log.config(state=tk.DISABLED)
-            self.text_log.yview(tk.END)
+        t_center = tu[i0] + 0.5 * (nperseg - 1) / fs
+        t_frames.append(t_center)
+        fpk.append(f_est)
 
-        if running:
-            # Update the graphs efficiently (redraw every 2 updates)
-            self.update_counter += 1
-            if self.update_counter % 2 == 0:
-                self.line1.set_ydata(heart_phase_values)
-                self.line2.set_ydata(breath_phase_values)
-                self.canvas.draw_idle()  # Use draw_idle for better performance
+    if len(t_frames) == 0:
+        return None, None
 
-        self.root.after(update_time, self.update_ui)
+    return np.array(t_frames, dtype=np.float64), np.array(fpk, dtype=np.float64)
 
-    def update_square_labels(self, HeartPhase, BreathPhase, TotalPhase, Distance):
-        """Update the square labels with the latest values."""
-        self.square_labels[0].config(text=f"Heart:\n{round(HeartPhase, decimal_round)}")
-        self.square_labels[1].config(text=f"Breath:\n{round(BreathPhase, decimal_round)}")
-        self.square_labels[2].config(text=f"Total:\n{round(TotalPhase, decimal_round)}")
-        if Distance is not None:
-            self.square_labels[3].config(text=f"Distance:\n{round(Distance, decimal_round)}")
 
-    def on_close(self):
-        """Handle application shutdown."""
-        global running
-        running = False
-        if serialPort and serialPort.is_open:
-            serialPort.close()
-        if self.csv_file:
-            self.csv_file.close()
-        self.root.quit()
-        self.root.destroy()
+def interp_common(t_src, y_src, t_dst):
+    t_src = np.asarray(t_src, dtype=np.float64)
+    y_src = np.asarray(y_src, dtype=np.float64)
+    ok = np.isfinite(t_src) & np.isfinite(y_src)
+    out = np.full_like(t_dst, np.nan, dtype=np.float64)
+    if np.sum(ok) < 2:
+        return out
+    out[:] = np.interp(t_dst, t_src[ok], y_src[ok], left=np.nan, right=np.nan)
+    return out
 
-def create_gui():
-    """Create and configure the GUI."""
-    global root
-    root = tk.Tk()
-    root.geometry("1200x800")
-    root.rowconfigure(0, weight=4)
-    root.rowconfigure(1, weight=1)
-    root.columnconfigure(0, weight=1)
-    app = SerialReaderApp(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_close)
-    return root
 
+def movmean_nan_uniform(y, win_n):
+    y = np.asarray(y, dtype=np.float64)
+    if win_n <= 1:
+        return y.copy()
+
+    valid = np.isfinite(y).astype(np.float64)
+    y0 = np.where(np.isfinite(y), y, 0.0)
+
+    k = np.ones(int(win_n), dtype=np.float64)
+    num = np.convolve(y0, k, mode="same")
+    den = np.convolve(valid, k, mode="same")
+
+    out = np.full_like(y, np.nan, dtype=np.float64)
+    m = den > 0
+    out[m] = num[m] / den[m]
+    return out
+
+
+def smooth_in_time_to_grid(t_src, y_src, t_grid, smooth_sec):
+    y_i = interp_common(t_src, y_src, t_grid)
+    win_n = int(max(1, round(float(smooth_sec) / float(DT_GRID))))
+    return movmean_nan_uniform(y_i, win_n)
+
+
+def metrics(yhat, yref):
+    m = np.isfinite(yhat) & np.isfinite(yref)
+    if np.sum(m) < 3:
+        return np.nan, np.nan, np.nan, 0
+    e = yhat[m] - yref[m]
+    mae  = float(np.mean(np.abs(e)))
+    rmse = float(np.sqrt(np.mean(e**2)))
+    corr = float(np.corrcoef(yhat[m], yref[m])[0, 1])
+    return mae, rmse, corr, int(np.sum(m))
+
+
+# ===================== MAIN ===================== #
 def main():
-    """Main function to initialize and run the application."""
-    initialize_serial()
-    root = create_gui()
-    root.mainloop()
+    tpuro_ms, heart, breath = read_phases_csv_matlab_style(PHASES_PATH)
+    t = (tpuro_ms - tpuro_ms[0]) / 1000.0
+    segments = segment_by_gaps(t, GAP_THR_SEC)
+
+    # frames (HR/BR)
+    tH_all, fH_all = [], []
+    tB_all, fB_all = [], []
+
+    # maior segmento HEART filtrado (pra espectrograma)
+    best_spec_len = -1
+    tu_spec = None
+    hu_spec_f = None
+
+    for s0, e0 in segments:
+        tseg = t[s0:e0+1]
+        hseg = heart[s0:e0+1]
+        bseg = breath[s0:e0+1]
+
+        # HEART
+        tu, hu = resample_poly_from_irregular(tseg, hseg, FS_TARGET)
+        if tu is not None and tu.size >= NPERSEG:
+            hu_f = zero_phase_bandpass(hu, FS_TARGET, HEART_WI_HZ, HEART_WF_HZ, BP_ORDER)
+
+            if hu_f.size > best_spec_len:
+                best_spec_len = hu_f.size
+                tu_spec = tu.copy()
+                hu_spec_f = hu_f.copy()
+
+            t_frames, fpk = rfft_fundamental_track_hop(
+                tu, hu_f, FS_TARGET, NPERSEG, HOP_SAMPLES, WINDOW, F_MIN_HZ
+            )
+            if t_frames is not None:
+                tH_all.append(t_frames)
+                fH_all.append(fpk)
+
+        # BREATH
+        tu, bu = resample_poly_from_irregular(tseg, bseg, FS_TARGET)
+        if tu is not None and tu.size >= NPERSEG:
+            bu_f = zero_phase_bandpass(bu, FS_TARGET, BREATH_WI_HZ, BREATH_WF_HZ, BP_ORDER)
+            t_frames, fpk = rfft_fundamental_track_hop(
+                tu, bu_f, FS_TARGET, NPERSEG, HOP_SAMPLES, WINDOW, F_MIN_HZ
+            )
+            if t_frames is not None:
+                tB_all.append(t_frames)
+                fB_all.append(fpk)
+
+    if len(tH_all) == 0:
+        raise RuntimeError("Não consegui extrair HR: segmentos muito curtos ou t inválido.")
+
+    # concat HR
+    t_hr_frames = np.concatenate(tH_all)
+    hr_bpm_frames = 60.0 * np.concatenate(fH_all)
+
+    # concat BR
+    if len(tB_all) > 0:
+        t_br_frames = np.concatenate(tB_all)
+        br_brpm_frames = 60.0 * np.concatenate(fB_all)
+    else:
+        t_br_frames = np.array([], dtype=np.float64)
+        br_brpm_frames = np.array([], dtype=np.float64)
+
+    # ===================== POLAR ===================== #
+    t_polar, hr_polar = None, None
+    if DO_POLAR_COMPARE:
+        try:
+            t_polar, hr_polar = read_txt_polar(POLAR_HR_PATH)
+        except Exception:
+            t_polar, hr_polar = None, None
+
+    # ===================== GRID comum (HR suavizado) ===================== #
+    t_common = np.arange(np.nanmin(t_hr_frames), np.nanmax(t_hr_frames) + 1e-12, DT_GRID, dtype=np.float64)
+    hr_radar_s = smooth_in_time_to_grid(t_hr_frames, hr_bpm_frames, t_common, SMOOTH_HR_SEC)
+
+    if t_polar is not None and hr_polar is not None:
+        hr_polar_i = interp_common(t_polar, hr_polar, t_common)
+        mae, rmse, corr, n = metrics(hr_radar_s, hr_polar_i)
+        print(f"Radar x Polar | N={n} | MAE={mae:.3f} bpm | RMSE={rmse:.3f} bpm | Corr={corr:.3f}")
+
+    # ===================== PLOT HR (opcional, mas útil) ===================== #
+    plt.figure()
+    plt.plot(t_common, hr_radar_s, label="Radar HR (movmean)")
+    if t_polar is not None and hr_polar is not None:
+        plt.plot(t_polar, hr_polar, label="Polar HR")
+    plt.xlabel("Tempo (s)")
+    plt.ylabel("HR (bpm)")
+    plt.title("HR (Radar vs Polar)")
+    plt.grid(True)
+    plt.legend()
+
+    # ===================== PLOT BR (opcional) ===================== #
+    if t_br_frames.size > 0:
+        tbr_grid = np.arange(np.nanmin(t_br_frames), np.nanmax(t_br_frames) + 1e-12, DT_GRID, dtype=np.float64)
+        br_radar_s = smooth_in_time_to_grid(t_br_frames, br_brpm_frames, tbr_grid, SMOOTH_BR_SEC)
+
+        plt.figure()
+        plt.plot(tbr_grid, br_radar_s, label="Radar BR (movmean)")
+        plt.xlabel("Tempo (s)")
+        plt.ylabel("RR (brpm)")
+        plt.title("BR (Radar)")
+        plt.grid(True)
+        plt.legend()
+
+    # ===================== ESPECTROGRAMA + POLAR POR CIMA (NO MESMO AX) ===================== #
+    if tu_spec is not None and hu_spec_f is not None and hu_spec_f.size >= NPERSEG:
+        noverlap = max(0, NPERSEG - HOP_SAMPLES)
+
+        f, tt, Sxx = spectrogram(
+            hu_spec_f,
+            fs=FS_TARGET,
+            window=get_window(WINDOW, NPERSEG),
+            nperseg=NPERSEG,
+            noverlap=noverlap,
+            detrend=False,
+            scaling="density",
+            mode="psd",
+        )
+
+        tt_abs = tu_spec[0] + tt
+
+        # 0..-40 dB relativo ao pico
+        Sxx_db = 10.0 * np.log10(Sxx + 1e-30)
+        Sxx_db = Sxx_db - np.nanmax(Sxx_db)
+        Sxx_db = np.clip(Sxx_db, -40.0, 0.0)
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        pcm = ax.pcolormesh(tt_abs, f, Sxx_db, shading="auto", vmin=-40.0, vmax=0.0)
+
+        ax.set_ylim(0.5, 3.0)  # ajuste se quiser
+        ax.set_xlabel("Tempo (s)")
+        ax.set_ylabel("Frequência (Hz)")
+        ax.set_title(
+            f"Espectrograma (HEART filtrado) | Fs={FS_TARGET:.1f}Hz | N={NPERSEG} | overlap={noverlap}\n"
+            f"BP: {HEART_WI_HZ:.2f}–{HEART_WF_HZ:.2f} Hz | escala: 0..-40 dB (rel. ao pico)"
+        )
+
+        cb = fig.colorbar(pcm, ax=ax, pad=0.02)
+        cb.set_label("PSD (dB rel. ao pico)")
+
+        # Polar por cima no MESMO PLOT usando eixo Y secundário em bpm (alinhado Hz*60)
+        ax_bpm = ax.twinx()
+        y0_hz, y1_hz = ax.get_ylim()
+        ax_bpm.set_ylim(y0_hz * 60.0, y1_hz * 60.0)
+        ax_bpm.set_ylabel("HR (bpm)")
+
+        if t_polar is not None and hr_polar is not None:
+            mpol = (
+                np.isfinite(t_polar) & np.isfinite(hr_polar) &
+                (t_polar >= tt_abs.min()) & (t_polar <= tt_abs.max())
+            )
+            if np.any(mpol):
+                ax_bpm.plot(t_polar[mpol], hr_polar[mpol], linewidth=2.0, label="Polar HR")
+                ax_bpm.legend(loc="upper right")
+
+        plt.tight_layout()
+
+    plt.show()
+
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,119 @@
+#include <Arduino.h>
+#include "LD6002.h"
+#include <stdint.h>
+
+// ---------- CÓDIGO 1: LD6002 (x15, x14) ----------
+
+LD6002 radar(Serial1);
+
+float lastHeartRate  = 0;
+float lastBreathRate = 0;
+float lastDistance   = 0;
+
+// ---------- CÓDIGO 2: LEITURA DIRETA (x13) ----------
+
+float leitor_bytes_phase(uint8_t *aux);
+
+// variáveis do parser x13 (mantidas como no seu código)
+uint8_t prox_byte = 0;
+static uint8_t buffer[32];
+int len = 0;
+float heart_phase, total_phase, breath_phase, dist; // dist vai ser preenchida pelo lastDistance
+static unsigned long t_phase = 0, t_dist = 0;
+static bool b_phase = false, b_dist = false;
+static const unsigned long MAX_dt = 0;
+
+// criador de CSV: exatamente o mesmo print que você já fazia
+void escreveCSV(unsigned long t_out,
+                float total_phase,
+                float breath_phase,
+                float heart_phase,
+                float dist)
+{
+  Serial.print(t_out);       Serial.print(",");
+  Serial.print(total_phase); Serial.print(",");
+  Serial.print(breath_phase);Serial.print(",");
+  Serial.print(heart_phase); Serial.print(",");
+  Serial.println(dist);
+}
+
+void setup()
+{
+  // Mantendo o baud do SEGUNDO código (você pode mudar se quiser)
+  Serial.begin(1382400);
+
+  // Serial1 igual em ambos os códigos
+  Serial1.begin(1382400, SERIAL_8N1, 21, 20);
+  Serial1.setTimeout(60);
+
+  // Cabeçalho CSV do segundo código
+  Serial.println("tempo,total_phase,breath_phase,heart_phase,dist");
+}
+
+void loop()
+{
+
+  // ---------- PARTE 2: parser -> AGORA SÓ A13 (x13) ----------
+
+  while (Serial1.available())
+  {
+    uint8_t s = Serial1.read();
+    if (s == 0x0A)
+    {
+      if (Serial1.readBytes(&prox_byte, 1) != 1) continue;
+
+      switch (prox_byte)
+      {
+      case 0x13:
+        len = 14;
+        if (len > (int)sizeof(buffer)) break;
+        buffer[0] = prox_byte;
+        {
+          size_t tam = Serial1.readBytes(&buffer[1], len - 1);
+          if (tam != len - 1) break;
+        }
+        t_phase = millis();
+        total_phase  = leitor_bytes_phase(&buffer[2]);
+        breath_phase = leitor_bytes_phase(&buffer[6]);
+        heart_phase  = leitor_bytes_phase(&buffer[10]);
+
+        // dist vem do último valor da biblioteca (mantém o formato sem depender do A16)
+        dist = lastDistance;
+
+        // imprime 1 linha CSV por A13 (mesmo formato)
+        escreveCSV(t_phase, total_phase, breath_phase, heart_phase, dist);
+
+        // mantém flags (mesmo que agora não use)
+        b_phase = false;
+        b_dist  = false;
+        break;
+
+      case 0x16:
+        // NÃO processa A16: só descarta o payload para não desalinhar o stream
+        len = 10;
+        if (len > (int)sizeof(buffer)) break;
+        {
+          uint8_t dump[32];
+          Serial1.readBytes(dump, (size_t)(len - 1));
+        }
+        break;
+
+      case 0x14:
+      default:
+        break;
+      }
+    }
+  }
+}
+
+// função de conversão de bytes -> float (mantida igual)
+float leitor_bytes_phase(uint8_t *aux)
+{
+  uint32_t u = (uint32_t)aux[0]
+             | ((uint32_t)aux[1] << 8)
+             | ((uint32_t)aux[2] << 16)
+             | ((uint32_t)aux[3] << 24);
+  float f;
+  memcpy(&f, &u, 4);
+  return f;
+}

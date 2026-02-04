@@ -1,0 +1,624 @@
+%% ========================================================================
+%  DATASET (MAT) -> RESAMPLE -> FILTFILT BP -> rFFT/HOP
+%  COMPARAÇÃO: ECG gabarito (tfm_ecg1) dentro do .mat
+%  + (OPCIONAL) PROTEÇÃO CONTRA HARMÔNICOS (2x/3x/4x) NO TRACKER
+%  (SEM GAUSS, SEM RIDGE, SEM PESO GAUSS NO ESPECTRO)
+% ========================================================================
+clc; clear; close all;
+
+%% ===================== PARÂMETROS =====================
+INPUT_PATH = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\datasets\Figshare\dta\GDN0001\GDN0001_2_Valsalva.mat';
+INPUT_MODE = 'radar';   % 'radar' | 'ecg1' | 'ecg2'
+
+% segmentação por buracos (s) - só para o espectrograma pegar um trecho contínuo
+GAP_THR_SEC = 0.6;
+
+% ===== CONFIG =====
+FS_TARGET   = 25.0;
+
+NPERSEG     = 128;
+HOP_SAMPLES = 32;
+WINDOW      = 'rect';
+F_MIN_HZ    = 0.15;
+
+% ===== FILTRO (filtfilt bandpass) =====
+PRE_BP_ORDER = 6;     % ordem FINAL (par: 2,4,6,8...)
+PRE_WI_HZ    = 1;
+PRE_WF_HZ    = 2.5;
+
+% ===== PROTEÇÃO CONTRA HARMÔNICOS (NO TRACKER) =====
+HARM_PROTECT_ON = 0;
+HARM_RATIO      = 0.5;
+HARM_MAX        = 4;
+HARM_TOL_BINS   = 0;
+
+% gabarito ECG (R-peaks)
+ECG_MIN_DIST_SEC = 0.35;
+ECG_MIN_PROM     = 2.0;
+HR_MIN_BPM = 30;
+HR_MAX_BPM = 220;
+
+% suavização em tempo
+DT_GRID       = 0.1;
+SMOOTH_HR_SEC = 5.0;
+
+% espectrograma
+SPEC_DB_CLIP = 40;
+SPEC_FMAX_HZ = 5.0;
+
+DEBUG_PRINT = true;
+
+%% ===================== LEITURA (DATASET) =====================
+[tpuro_ms, heart_raw, baseName] = load_phase_for_algorithm(INPUT_PATH, INPUT_MODE);
+
+t0 = (tpuro_ms - tpuro_ms(1))/1000;  % s
+t0 = t0(:);
+heart_raw = heart_raw(:);
+
+m = isfinite(t0) & isfinite(heart_raw);
+t0 = t0(m);
+heart_raw = heart_raw(m);
+
+heart_raw = heart_raw - mean(heart_raw,'omitnan');
+
+if numel(t0) < 10
+    error('Sinal muito curto.');
+end
+
+%% ===================== RESAMPLE PARA FS_TARGET =====================
+[t_u, heart_u] = resample_to_target_fs(t0, heart_raw, FS_TARGET);
+
+if numel(heart_u) < NPERSEG
+    error('Poucos pontos após resample para rodar NPERSEG=%d.', NPERSEG);
+end
+
+segments = segment_by_gaps(t_u, GAP_THR_SEC);
+
+%% ===================== FILTRO (filtfilt bandpass) =====================
+heart_bp = zero_phase_bandpass(heart_u, FS_TARGET, PRE_WI_HZ, PRE_WF_HZ, PRE_BP_ORDER);
+
+% sinal que entra no tracker
+heart_track = heart_bp;
+
+%% ===================== DEBUG (fração de energia < 0.5Hz) =====================
+if DEBUG_PRINT
+    x1 = heart_u(:);     x1 = x1 - mean(x1,'omitnan');
+    x2 = heart_bp(:);    x2 = x2 - mean(x2,'omitnan');
+
+    frac1 = frac_energy_below(x1, FS_TARGET, 0.5);
+    frac2 = frac_energy_below(x2, FS_TARGET, 0.5);
+
+    df = FS_TARGET/NPERSEG;
+
+    fprintf('--- DEBUG INPUT ---\n');
+    fprintf('len heart_u=%d | heart_bp=%d\n', numel(heart_u), numel(heart_bp));
+    fprintf('FS_TARGET=%.2f | NPERSEG=%d | df=%.6f Hz (%.2f bpm)\n', FS_TARGET, NPERSEG, df, df*60);
+    fprintf('WIN=%s | HOP=%d | BP=%dª %.2f-%.2f Hz | HarmOn=%d\n', WINDOW, HOP_SAMPLES, PRE_BP_ORDER, PRE_WI_HZ, PRE_WF_HZ, HARM_PROTECT_ON);
+    fprintf('Energy < 0.50Hz: before=%.3f | after BP=%.3f\n', frac1, frac2);
+end
+
+%% ===================== rFFT/HOP (TRACK + HARM PROTECT) =====================
+[t_hr_frames, f_hr_hz] = rfft_fundamental_track_hop(t_u, heart_track, FS_TARGET, ...
+    NPERSEG, HOP_SAMPLES, WINDOW, F_MIN_HZ, ...
+    HARM_PROTECT_ON, HARM_RATIO, HARM_MAX, HARM_TOL_BINS);
+
+if isempty(t_hr_frames)
+    error('Não consegui extrair HR (frames vazios).');
+end
+hr_bpm_frames = 60 * f_hr_hz;
+
+%% ===================== GABARITO ECG (HR ref) ALINHADO EM t_u =====================
+[hr_ref_bpm, dbg_ecg] = hr_gabarito_from_ecg( ...
+    INPUT_PATH, t_u, ECG_MIN_DIST_SEC, ECG_MIN_PROM, HR_MIN_BPM, HR_MAX_BPM);
+
+hasECG = ~isempty(hr_ref_bpm) && any(isfinite(hr_ref_bpm));
+
+%% ===================== GRID + SUAVIZAÇÃO + MÉTRICAS =====================
+t_start  = min(t_hr_frames);
+t_end    = max(t_hr_frames);
+t_common = (t_start:DT_GRID:t_end)';
+
+HR_radar_grid = smooth_in_time_to_grid(t_hr_frames, hr_bpm_frames, t_common, DT_GRID, SMOOTH_HR_SEC);
+
+MAE = nan; RMSE = nan; R = nan; Nuse = 0;
+HR_ref_grid = nan(size(t_common));
+
+if hasECG
+    HR_ref_grid = interp_common(t_u, hr_ref_bpm, t_common);
+    [MAE, RMSE, R, Nuse] = metrics(HR_radar_grid, HR_ref_grid);
+    fprintf('Radar x ECG | N=%d | MAE=%.3f bpm | RMSE=%.3f bpm | Corr=%.3f | Rpeaks=%d\n', ...
+        Nuse, MAE, RMSE, R, dbg_ecg.n_peaks);
+else
+    fprintf('[AVISO] Sem gabarito ECG nesse arquivo.\n');
+end
+
+%% ===================== PLOTS (1 FIGURA) =====================
+fig = figure('Color','w','Name',sprintf('%s | rFFT/HOP', baseName),'NumberTitle','off');
+try
+    set(fig,'WindowState','maximized');
+catch
+    set(fig,'Units','normalized','OuterPosition',[0 0 1 1]);
+end
+set(fig,'Renderer','opengl');
+
+tl = tiledlayout(fig, 2, 1, 'TileSpacing','compact', 'Padding','compact');
+
+% ---- 1) HR (Radar vs ECG) ----
+ax1 = nexttile(tl,1);
+plot(ax1, t_common, HR_radar_grid, 'k-', 'LineWidth', 1.8); hold(ax1,'on');
+
+if hasECG
+    plot(ax1, t_common, HR_ref_grid, 'c--', 'LineWidth', 1.4);
+    legend(ax1, 'Radar HR (smooth)', 'ECG HR (interp)', 'Location','best');
+else
+    legend(ax1, 'Radar HR (smooth)', 'Location','best');
+end
+
+grid(ax1,'on');
+xlabel(ax1,'Tempo (s)');
+ylabel(ax1,'HR (bpm)');
+
+title(ax1, sprintf(['%s | Fs=%.1f | N=%d | Hop=%d | Win=%s | BP=%dª %.2f–%.2f Hz | ' ...
+    'HarmOn=%d | MAE=%.2f RMSE=%.2f Corr=%.3f'], ...
+    baseName, FS_TARGET, NPERSEG, HOP_SAMPLES, WINDOW, PRE_BP_ORDER, PRE_WI_HZ, PRE_WF_HZ, ...
+    HARM_PROTECT_ON, MAE, RMSE, R));
+
+xlim(ax1,[t_common(1) t_common(end)]);
+hold(ax1,'off');
+
+% ---- 2) ESPECTROGRAMA (heart_track) + ECG por cima (Hz) ----
+ax2 = nexttile(tl,2);
+
+[tu_spec, x_spec] = pick_largest_segment(t_u, heart_track, segments);
+
+if isempty(x_spec) || numel(x_spec) < NPERSEG
+    axis(ax2,'off');
+    text(ax2,0.5,0.5,'Espectrograma: sem dados/segmento curto','HorizontalAlignment','center');
+else
+    win = make_window(NPERSEG, WINDOW);
+    noverlap = max(0, NPERSEG - HOP_SAMPLES);
+
+    [~, F, T, P] = spectrogram(x_spec, win, noverlap, NPERSEG, FS_TARGET, 'psd');
+
+    P_db = 10*log10(P + 1e-30);
+    P_db = P_db - max(P_db(:));
+    P_db(P_db < -SPEC_DB_CLIP) = -SPEC_DB_CLIP;
+
+    T_abs = tu_spec(1) + T;
+
+    maskF = (F <= SPEC_FMAX_HZ);
+    imagesc(ax2, T_abs, F(maskF), P_db(maskF,:));
+    axis(ax2,'xy');
+    ylim(ax2,[0 SPEC_FMAX_HZ]);
+    caxis(ax2,[-SPEC_DB_CLIP 0]);
+    colormap(ax2, parula);
+    cb = colorbar(ax2);
+    cb.Label.String = sprintf('PSD (dB rel. pico) [%d..0]', -SPEC_DB_CLIP);
+
+    grid(ax2,'on');
+    xlabel(ax2,'Tempo (s)');
+    ylabel(ax2,'Frequência (Hz)');
+    title(ax2, sprintf('Espectrograma (pós BP) | 0..-%ddB | N=%d', SPEC_DB_CLIP, NPERSEG));
+
+    hold(ax2,'on');
+    if hasECG
+        m2 = isfinite(hr_ref_bpm) & (t_u >= min(T_abs)) & (t_u <= max(T_abs));
+        if any(m2)
+            plot(ax2, t_u(m2), hr_ref_bpm(m2)/60, 'w-', 'LineWidth', 2);
+        end
+    end
+    hold(ax2,'off');
+end
+
+drawnow;
+
+%% ========================================================================
+%                                FUNÇÕES
+% ========================================================================
+
+function segments = segment_by_gaps(t, gap_thr)
+    t = t(:);
+    n = numel(t);
+    if n < 2
+        segments = [1 n];
+        return;
+    end
+    breaks = find(diff(t) > gap_thr);
+    if isempty(breaks)
+        segments = [1 n];
+    else
+        segments = [[1; breaks+1], [breaks; n]];
+    end
+end
+
+function [t_u, x_u] = resample_to_target_fs(t, x, fs_target)
+    t = t(:); x = x(:);
+
+    [t, iu] = unique(t,'stable');
+    x = x(iu);
+
+    dt_pos = diff(t);
+    dt_pos = dt_pos(dt_pos > 0);
+    if isempty(dt_pos)
+        error('Tempo inválido: diff(t) sem valores positivos.');
+    end
+    fs0 = 1/median(dt_pos);
+
+    dt0 = 1/fs0;
+    t_reg = (t(1):dt0:t(end))';
+    x_reg = interp1(t, x, t_reg, 'linear');
+    ok = isfinite(x_reg);
+    t_reg = t_reg(ok);
+    x_reg = x_reg(ok);
+
+    [p,q] = rat(fs_target/fs0, 1e-12);
+    x_u = resample(x_reg - mean(x_reg,'omitnan'), p, q);
+
+    t_u = t_reg(1) + (0:numel(x_u)-1)'/fs_target;
+end
+
+function y = zero_phase_bandpass(x, fs, wi_hz, wf_hz, order_final)
+    x = x(:);
+    if numel(x) < 8, y = x; return; end
+    if wf_hz >= fs/2, y = x; return; end
+    if wi_hz <= 0 || wi_hz >= wf_hz, y = x; return; end
+    if mod(order_final,2) ~= 0
+        error('Ordem FINAL do bandpass deve ser par (2,4,6,8...).');
+    end
+    n_butter = order_final/2;
+    [b,a] = butter(n_butter, [wi_hz wf_hz]/(fs/2), 'bandpass');
+
+    padlen = 3*(max(length(a), length(b)) - 1);
+    if numel(x) <= padlen, y = x; return; end
+
+    y = filtfilt(b,a,x);
+end
+
+function [t_frames, fpk_hz] = rfft_fundamental_track_hop(tu, xu, fs, nperseg, hop, winSpec, f_min_hz, ...
+                                                        harm_on, harm_ratio, harm_max, harm_tol_bins)
+    tu = tu(:); xu = xu(:);
+
+    if numel(xu) < nperseg || numel(tu) ~= numel(xu)
+        t_frames = []; fpk_hz = []; return;
+    end
+
+    win  = make_window(nperseg, winSpec);
+    nfft = nperseg;
+    half = floor(nfft/2) + 1;
+
+    f_ax  = (0:half-1)' * (fs/nfft);
+
+    k_min = ceil(f_min_hz * nfft / fs);
+    k_min = max(2, k_min);
+
+    t_frames = [];
+    fpk_hz   = [];
+
+    idx0 = 1;
+    while (idx0 + nperseg - 1) <= numel(xu)
+
+        xw = xu(idx0:idx0+nperseg-1) .* win;
+        xw = xw - mean(xw,'omitnan');
+
+        X = fft(xw, nfft);
+        P = abs(X(1:half)).^2;
+
+        if k_min > numel(P)
+            idx0 = idx0 + hop;
+            continue;
+        end
+
+        [~, rel] = max(P(k_min:end));
+        k0 = k_min + rel - 1;
+
+        delta0 = parabolic_peak_interp_logP(P, k0);
+        f_peak = (k0 - 1 + delta0) * fs / nfft;
+        P_peak = P(k0);
+
+        f_est = f_peak;
+
+        if harm_on && isfinite(f_peak) && (P_peak > 0)
+            for h = 2:harm_max
+                fc = f_peak / h;
+                if fc <= 0 || fc < f_ax(k_min) || fc > f_ax(end)
+                    continue;
+                end
+
+                k_c = round(fc * nfft / fs) + 1;
+                k1 = max(k_min, k_c - harm_tol_bins);
+                k2 = min(numel(P), k_c + harm_tol_bins);
+                if k2 < k1, continue; end
+
+                [P_c, kk_rel] = max(P(k1:k2));
+                kk = k1 + kk_rel - 1;
+
+                if P_c >= (harm_ratio * P_peak)
+                    deltac = parabolic_peak_interp_logP(P, kk);
+                    f_est = (kk - 1 + deltac) * fs / nfft;
+                    break;
+                end
+            end
+        end
+
+        t_center = tu(idx0) + 0.5*(nperseg-1)/fs;
+        t_frames(end+1,1) = t_center;
+        fpk_hz(end+1,1)   = f_est;
+
+        idx0 = idx0 + hop;
+    end
+end
+
+function delta = parabolic_peak_interp_logP(P, k)
+    if k <= 1 || k >= numel(P), delta = 0; return; end
+    la = log(P(k-1) + 1e-20);
+    lb = log(P(k)   + 1e-20);
+    lc = log(P(k+1) + 1e-20);
+    denom = (la - 2*lb + lc);
+    if denom == 0 || ~isfinite(denom), delta = 0; return; end
+    delta = 0.5*(la - lc)/denom;
+    if ~isfinite(delta), delta = 0; end
+    delta = max(-0.75, min(0.75, delta));
+end
+
+function y_grid = smooth_in_time_to_grid(t_src, y_src, t_grid, dt_grid, smooth_sec)
+    y_i = interp_common(t_src, y_src, t_grid);
+    win_n = max(1, round(smooth_sec/dt_grid));
+    y_grid = movmean(y_i, win_n, 'omitnan');
+end
+
+function out = interp_common(t_src, y_src, t_dst)
+    t_src = t_src(:); y_src = y_src(:); t_dst = t_dst(:);
+    ok = isfinite(t_src) & isfinite(y_src);
+    out = nan(size(t_dst));
+    if sum(ok) < 2, return; end
+    out = interp1(t_src(ok), y_src(ok), t_dst, 'linear', nan);
+end
+
+function [MAE, RMSE, R, n] = metrics(yhat, yref)
+    m = isfinite(yhat) & isfinite(yref);
+    n = sum(m);
+    if n < 3
+        MAE = nan; RMSE = nan; R = nan; return;
+    end
+    e = yhat(m) - yref(m);
+    MAE  = mean(abs(e));
+    RMSE = sqrt(mean(e.^2));
+    R = corr(yhat(m), yref(m));
+end
+
+function [tpuro_ms, heart, baseName] = load_phase_for_algorithm(path_in, mode_in)
+    [~, baseName, ext] = fileparts(path_in);
+    ext = lower(ext);
+
+    if ~strcmp(ext,'.mat')
+        error('Este script é para DATASET .mat. (Você passou %s)', ext);
+    end
+
+    S = load(path_in);
+    mode = lower(string(mode_in));
+
+    switch mode
+        case "ecg1"
+            if ~(isfield(S,'tfm_ecg1') && isfield(S,'fs_ecg'))
+                error('INPUT_MODE=ecg1, mas faltam tfm_ecg1/fs_ecg no MAT.');
+            end
+            x  = double(S.tfm_ecg1(:));
+            fs = double(S.fs_ecg);
+
+            tpuro_ms = ((0:numel(x)-1)'/fs)*1000;
+            phase = unwrap(x);
+            heart = wrap_phase(phase);
+
+        case "ecg2"
+            if ~(isfield(S,'tfm_ecg2') && isfield(S,'fs_ecg'))
+                error('INPUT_MODE=ecg2, mas faltam tfm_ecg2/fs_ecg no MAT.');
+            end
+            x  = double(S.tfm_ecg2(:));
+            fs = double(S.fs_ecg);
+
+            tpuro_ms = ((0:numel(x)-1)'/fs)*1000;
+            phase = unwrap(x);
+            heart = wrap_phase(phase);
+
+        otherwise % "radar"
+            if ~(isfield(S,'radar_i') && isfield(S,'radar_q') && isfield(S,'fs_radar'))
+                error('INPUT_MODE=radar, mas faltam radar_i/radar_q/fs_radar no MAT.');
+            end
+            I  = double(S.radar_i(:));
+            Q  = double(S.radar_q(:));
+            fs = double(S.fs_radar);
+
+            phase = unwrap(atan2(Q, I));
+            heart = wrap_phase(phase);
+
+            tpuro_ms = ((0:numel(I)-1)'/fs)*1000;
+    end
+end
+
+function ph_wrapped = wrap_phase(ph)
+    ph = ph(:);
+    ok = isfinite(ph);
+    if ~all(ok)
+        ph(~ok) = interp1(find(ok), ph(ok), find(~ok), 'linear', 'extrap');
+    end
+    ph_wrapped = mod(ph + pi, 2*pi) - pi;
+    ph_wrapped = ph_wrapped - mean(ph_wrapped,'omitnan');
+end
+
+function [hr_ref_bpm, dbg] = hr_gabarito_from_ecg(path_in, t_radar, minDistSec, minProm, hrMin, hrMax)
+    dbg = struct('n_peaks',0);
+
+    if ~endsWith(lower(path_in), '.mat')
+        hr_ref_bpm = [];
+        return;
+    end
+
+    S = load(path_in);
+
+    if ~(isfield(S,'tfm_ecg1') && isfield(S,'fs_ecg'))
+        hr_ref_bpm = [];
+        return;
+    end
+
+    ecg = double(S.tfm_ecg1(:));
+    fs  = double(S.fs_ecg);
+
+    if isempty(ecg) || ~isfinite(fs) || fs <= 0
+        hr_ref_bpm = [];
+        return;
+    end
+
+    w_baseline = max(3, round(0.20 * fs));
+    ecg0 = ecg - movmedian(ecg, w_baseline, 'Endpoints','shrink');
+
+    f1 = 5; f2 = 25;
+    if f2 >= fs/2, f2 = 0.9*(fs/2); end
+    if f1 <= 0 || f1 >= f2
+        hr_ref_bpm = NaN(size(t_radar));
+        return;
+    end
+    [b,a] = butter(2, [f1 f2]/(fs/2), 'bandpass');
+    ecg_f = filtfilt(b,a, ecg0);
+
+    ecg_f = ecg_f / (mad(ecg_f,1) + eps);
+
+    d = [0; diff(ecg_f)];
+    d = d / (mad(d,1) + eps);
+    sq = d.^2;
+
+    w_int = max(3, round(0.12 * fs));
+    mwi = movmean(sq, w_int, 'Endpoints','shrink');
+
+    thr = median(mwi) + 3.0*mad(mwi,1);
+
+    minDistSec2 = max(minDistSec, 60/hrMax);
+    minDistSmp  = max(1, round(minDistSec2 * fs));
+    prom_adapt = max(minProm, 1.5*mad(mwi,1));
+
+    [~, locs_env] = findpeaks(mwi, ...
+        'MinPeakDistance',  minDistSmp, ...
+        'MinPeakHeight',    thr, ...
+        'MinPeakProminence', prom_adapt);
+
+    dbg.n_peaks = numel(locs_env);
+    if dbg.n_peaks < 3
+        hr_ref_bpm = NaN(size(t_radar));
+        return;
+    end
+
+    w_ref = max(1, round(0.08 * fs));
+    locs_R = zeros(size(locs_env));
+    n = numel(ecg_f);
+
+    for k = 1:numel(locs_env)
+        c = locs_env(k);
+        i1 = max(1, c - w_ref);
+        i2 = min(n, c + w_ref);
+        [~, im] = max(abs(ecg_f(i1:i2)));
+        locs_R(k) = i1 + im - 1;
+    end
+
+    locs_R = unique(locs_R, 'stable');
+    dbg.n_peaks = numel(locs_R);
+
+    if dbg.n_peaks < 3
+        hr_ref_bpm = NaN(size(t_radar));
+        return;
+    end
+
+    t_ecg = (0:numel(ecg_f)-1)'/fs;
+    t_R = t_ecg(locs_R);
+
+    RR = diff(t_R);
+    if isempty(RR)
+        hr_ref_bpm = NaN(size(t_radar));
+        return;
+    end
+
+    hr_inst = 60 ./ RR;
+    t_hr = t_R(1:end-1) + RR/2;
+
+    ok = isfinite(hr_inst) & isfinite(t_hr) & (hr_inst >= hrMin) & (hr_inst <= hrMax);
+
+    RR_ok = RR(ok);
+    if numel(RR_ok) >= 5
+        medRR = median(RR_ok);
+        ok = ok & (RR > 0.5*medRR) & (RR < 1.8*medRR);
+    end
+
+    t_hr = t_hr(ok);
+    hr_inst = hr_inst(ok);
+
+    if numel(hr_inst) < 3
+        hr_ref_bpm = NaN(size(t_radar));
+        return;
+    end
+
+    hr_ref_bpm = interp1(t_hr, hr_inst, t_radar, 'linear', 'extrap');
+end
+
+function [tu_best, x_best] = pick_largest_segment(tu, x, segments)
+    tu_best = []; x_best = [];
+    bestLen = -1;
+    for k = 1:size(segments,1)
+        i0 = segments(k,1);
+        i1 = segments(k,2);
+        L = i1 - i0 + 1;
+        if L > bestLen
+            bestLen = L;
+            tu_best = tu(i0:i1);
+            x_best  = x(i0:i1);
+        end
+    end
+end
+
+function frac = frac_energy_below(x, fs, fcut)
+    x = x(:);
+    x(~isfinite(x)) = 0;
+    x = x - mean(x,'omitnan');
+    N = 2^nextpow2(max(64, numel(x)));
+    X = fft(x, N);
+    P = abs(X).^2;
+    f = (0:N-1)'*(fs/N);
+    fneg = f;
+    m = f > fs/2;
+    fneg(m) = f(m) - fs;
+    Ptot = sum(P) + eps;
+    frac = sum(P(abs(fneg) <= fcut)) / Ptot;
+end
+
+function w = make_window(N, spec)
+    spec = lower(string(spec));
+    parts = split(spec, ":");
+    name = parts(1);
+    hasParam = numel(parts) > 1;
+    if hasParam
+        p = str2double(parts(2));
+        if ~isfinite(p), hasParam = false; end
+    end
+
+    switch name
+        case "hann"
+            w = hann(N,'periodic');
+        case "hamming"
+            w = hamming(N,'periodic');
+        case "blackman"
+            w = blackman(N,'periodic');
+        case "bartlett"
+            w = bartlett(N);
+        case "rect"
+            w = rectwin(N);
+        case "kaiser"
+            if ~hasParam, p = 8; end
+            w = kaiser(N, p);
+        case "tukey"
+            if ~hasParam, p = 0.25; end
+            w = tukeywin(N, p);
+        case "cheb"
+            if ~hasParam, p = 60; end
+            w = chebwin(N, p);
+        otherwise
+            w = hann(N,'periodic');
+    end
+    w = w(:);
+end

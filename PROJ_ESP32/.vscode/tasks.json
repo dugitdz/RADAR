@@ -1,0 +1,21 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build-fftw",
+      "type": "shell",
+      "command": "C:\\msys64\\ucrt64\\bin\\gcc.exe",
+      "args": [
+        "-Wall",
+        "-Wextra",
+        "-g3",
+        "c:\\Users\\eduar\\UTFPR\\IC\\PROJ_ESP32\\FFT_C.c",
+        "-o",
+        "c:\\Users\\eduar\\UTFPR\\IC\\PROJ_ESP32\\output\\FFT_C.exe",
+        "-lfftw3",
+        "-lm"
+      ],
+      "problemMatcher": ["$gcc"]
+    }
+  ]
+}

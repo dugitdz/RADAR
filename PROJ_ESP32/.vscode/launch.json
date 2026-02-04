@@ -2,16 +2,37 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "Run FFT_C (FFTW) [build-fftw]",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "c:/Users/eduar/UTFPR/IC/PROJ_ESP32/output/FFT_C.exe",
+      "cwd": "c:/Users/eduar/UTFPR/IC/PROJ_ESP32/output",
+      "preLaunchTask": "build-fftw",
+      "args": [],
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "C:\\msys64\\ucrt64\\bin\\gdb.exe",
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing for gdb",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+
+    {
       "name": "C/C++ Runner: Debug Session",
       "type": "cppdbg",
       "request": "launch",
       "args": [],
       "stopAtEntry": false,
-      "externalConsole": true,
-      "cwd": ".",
-      "program": "build/Debug/outDebug",
+      "externalConsole": false,
+      "cwd": "c:/Users/eduar/UTFPR/IC/PROJ_ESP32",
+      "program": "c:/Users/eduar/UTFPR/IC/PROJ_ESP32/build/Debug/outDebug",
       "MIMode": "gdb",
-      "miDebuggerPath": "gdb",
+      "miDebuggerPath": "C:\\msys64\\ucrt64\\bin\\gdb.exe",
       "setupCommands": [
         {
           "description": "Enable pretty-printing for gdb",

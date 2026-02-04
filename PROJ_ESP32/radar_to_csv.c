@@ -13,7 +13,7 @@
 
 // ======== CONFIGURAÇÃO POR DEFINE ========
 #define PORT_NAME   "COM5"
-#define BAUD_RATE   115200
+#define BAUD_RATE   1382400
 // ========================================
 
 #define READ_BUF_SZ  4096
@@ -141,7 +141,7 @@ int main(void){
 
     FILE* fHeart    = fopen("heart_rate.csv","a");
     FILE* fBreath   = fopen("breath_rate.csv","a");
-    FILE* fPhaseRaw = fopen("phases_raw.csv","a");  // novo arquivo
+    FILE* fPhaseRaw = fopen("phases_.csv","a");  // novo arquivo
 
     if(!fHeart || !fBreath || !fPhaseRaw){
         fprintf(stderr, "Erro abrindo CSVs para escrita.\n");
