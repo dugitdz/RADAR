@@ -22,8 +22,8 @@ F_MIN_HZ       = 0.05;
 MIN_POINTS_AFTER_RESAMPLE = 32;
 MIN_METRIC_SAMPLES        = 10;
 
-CFG.N      = 128;
-CFG.hop    = 64;
+CFG.N      = 64;
+CFG.hop    = 32;
 CFG.WRAP   = 0;
 
 CFG.win    = "flattop";

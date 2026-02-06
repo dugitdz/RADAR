@@ -48,6 +48,10 @@ DEBUG_EVERY_N   = 50
 CSV_ON          = 1
 CSV_FLUSH_EVERY = 8
 CSV_MAX_QUEUE   = 200000
+<<<<<<< HEAD
+=======
+
+>>>>>>> 700179eff6dd2e0e3752e31b9a4aed0a0c305b57
 
 
 # ===================== BLE PACKET =====================
@@ -201,6 +205,7 @@ def _estimate_fs_from_t(tw):
     return 1.0 / m
 
 
+<<<<<<< HEAD
 def _col_name(col_idx: int) -> str:
     if col_idx == 1:
         return "total"
@@ -209,6 +214,41 @@ def _col_name(col_idx: int) -> str:
     if col_idx == 3:
         return "heart"
     return f"col{col_idx}"
+=======
+def _try_filter_cheby2_filtfilt(x, fs, wi, wf, ford, Rs):
+    if (not _HAVE_SCIPY) or (not np.isfinite(fs)) or fs <= 0:
+        return None, "no_scipy_or_bad_fs"
+    if (not np.isfinite(wi)) or (not np.isfinite(wf)) or wi <= 0 or wf <= 0 or wf <= wi:
+        return None, "bad_wi_wf"
+    nyq = 0.5 * fs
+    if not np.isfinite(nyq) or nyq <= 0:
+        return None, "bad_nyq"
+    if wf >= nyq:
+        return None, "wf>=nyq"
+    wn = np.array([wi / nyq, wf / nyq], dtype=float)
+    if np.any(~np.isfinite(wn)) or np.any(wn <= 0) or np.any(wn >= 1) or wn[1] <= wn[0]:
+        return None, "bad_wn"
+    if (ford % 2) != 0 or ford < 2:
+        return None, "bad_ford"
+    n = int(ford // 2)
+    x = np.asarray(x, dtype=float).reshape(-1)
+    if x.size < 8:
+        return None, "too_short"
+    try:
+        b, a = cheby2(N=n, rs=float(Rs), Wn=wn, btype="bandpass", analog=False, output="ba")
+    except Exception:
+        return None, "cheby2_fail"
+    try:
+        padlen_default = 3 * (max(len(a), len(b)) - 1)
+        if x.size <= padlen_default:
+            return None, f"padlen_too_big({padlen_default})"
+        y = filtfilt(b, a, x)
+    except Exception:
+        return None, "filtfilt_fail"
+    if y.shape != x.shape or np.any(~np.isfinite(y)):
+        return None, "nan_after_filter"
+    return y, None
+>>>>>>> 700179eff6dd2e0e3752e31b9a4aed0a0c305b57
 
 
 def _pick_signal_by_col(total: float, breath: float, heart: float, col_idx: int) -> float:
@@ -230,11 +270,14 @@ class State:
         # shared time
         self.t = deque(maxlen=200000)
 
+<<<<<<< HEAD
         # signals used for FFT (HR and BR)
         self.x_hr = deque(maxlen=200000)
         self.x_br = deque(maxlen=200000)
 
         # raw channels
+=======
+>>>>>>> 700179eff6dd2e0e3752e31b9a4aed0a0c305b57
         self.t_total  = deque(maxlen=30000)
         self.total    = deque(maxlen=30000)
         self.t_breath = deque(maxlen=30000)
@@ -242,7 +285,13 @@ class State:
         self.t_heart  = deque(maxlen=30000)
         self.heart    = deque(maxlen=30000)
 
+<<<<<<< HEAD
         # outputs
+=======
+        self.t_hf     = deque(maxlen=30000)
+        self.heart_f  = deque(maxlen=30000)
+
+>>>>>>> 700179eff6dd2e0e3752e31b9a4aed0a0c305b57
         self.hr_t = deque(maxlen=MAXP)
         self.hr   = deque(maxlen=MAXP)
         self.br_t = deque(maxlen=MAXP)
@@ -262,6 +311,66 @@ class State:
         self.csv_queue = deque(maxlen=CSV_MAX_QUEUE)
         self.csv_lock = threading.Lock()
         self.csv_flush_counter = 0
+
+        self.win_id = 0
+        self.filter_ok = 0
+        self.filter_fail = 0
+        self.filter_last_err = ""
+
+        self.csv_path = None
+        self.csv_queue = deque(maxlen=CSV_MAX_QUEUE)
+        self.csv_lock = threading.Lock()
+        self.csv_flush_counter = 0
+
+
+def _csv_init(st: State):
+    if not CSV_ON:
+        return
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    st.csv_path = f"ble_filter_debug_{ts}.csv"
+    with open(st.csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["win_id", "t_center_s", "fs_win_hz", "bp_on", "bp_ok", "bp_err",
+                    "t_s", "x_raw", "x_filt"])
+
+
+def _csv_enqueue_window(st: State, win_id, t_center, fs, bp_on, bp_ok, bp_err, tw, x_raw, x_filt):
+    if not CSV_ON or st.csv_path is None:
+        return
+    tw = np.asarray(tw, dtype=float).reshape(-1)
+    x_raw = np.asarray(x_raw, dtype=float).reshape(-1)
+    x_filt = np.asarray(x_filt, dtype=float).reshape(-1)
+    n = min(tw.size, x_raw.size, x_filt.size)
+    if n <= 0:
+        return
+    rows = []
+    for i in range(n):
+        rows.append([int(win_id), float(t_center), float(fs), int(bp_on), int(bp_ok), str(bp_err),
+                     float(tw[i]), float(x_raw[i]), float(x_filt[i])])
+    with st.csv_lock:
+        for r in rows:
+            st.csv_queue.append(r)
+        st.csv_flush_counter += 1
+
+
+def _csv_flush(st: State, force=False):
+    if not CSV_ON or st.csv_path is None:
+        return
+    with st.csv_lock:
+        if (not force) and (st.csv_flush_counter < CSV_FLUSH_EVERY):
+            return
+        if len(st.csv_queue) == 0:
+            st.csv_flush_counter = 0
+            return
+        batch = list(st.csv_queue)
+        st.csv_queue.clear()
+        st.csv_flush_counter = 0
+    try:
+        with open(st.csv_path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerows(batch)
+    except Exception:
+        pass
 
 
 # ===================== CSV =====================
@@ -360,9 +469,14 @@ def process_if_possible(st: State, max_windows=2):
         if idx_start < 0:
             return
 
+<<<<<<< HEAD
         tw   = t_arr[idx_start:idx_end]
         x_hr = x_hr_arr[idx_start:idx_end]
         x_br = x_br_arr[idx_start:idx_end]
+=======
+        tw = t_arr[idx_start:idx_end]
+        xw_raw = x_arr[idx_start:idx_end]
+>>>>>>> 700179eff6dd2e0e3752e31b9a4aed0a0c305b57
 
         fs = _estimate_fs_from_t(tw)
         if not np.isfinite(fs) or fs <= 0:
@@ -370,6 +484,7 @@ def process_if_possible(st: State, max_windows=2):
 
         t_center = float(tw[0] + 0.5 * (tw[-1] - tw[0]))
 
+<<<<<<< HEAD
         hr = estimate_rate_window(
             x_hr, fs, CFG["hr_f_min_hz"],
             CFG["hr_harm_on"], CFG["hr_harm_max"], CFG["hr_harm_tol"], CFG["hr_harm_ratio"],
@@ -414,16 +529,77 @@ def process_if_possible(st: State, max_windows=2):
         # - se os dois deram NaN, não anda (espera acumular)
         # - se pelo menos um deu valor, anda
         if (not np.isfinite(hr)) and (not np.isfinite(br)):
+=======
+        bp_ok = 0
+        bp_err = ""
+        x_use = xw_raw
+
+        if BP.get("on", 1):
+            y, err = _try_filter_cheby2_filtfilt(
+                xw_raw, fs, float(BP["wi"]), float(BP["wf"]), int(BP["ford"]), float(BP["Rs"])
+            )
+            if y is not None:
+                x_use = y
+                bp_ok = 1
+            else:
+                bp_err = err if err else "bp_unknown"
+
+        hr = estimate_hr_window(
+            x_use, fs, CFG["f_min_hz"],
+            CFG["harm_on"], CFG["harm_max"], CFG["harm_tol"], CFG["harm_ratio"]
+        )
+
+        with st.lock:
+            st.win_id += 1
+            win_id = st.win_id
+
+            if BP.get("on", 1):
+                if bp_ok:
+                    st.filter_ok += 1
+                    st.filter_last_err = ""
+                else:
+                    st.filter_fail += 1
+                    st.filter_last_err = bp_err
+
+            st.fs_t.append(t_center); st.fs.append(float(fs))
+            if np.isfinite(hr):
+                st.hr_t.append(t_center); st.hr.append(float(hr))
+
+            t_tail = tw[-hop:] if hop <= tw.size else tw
+            raw_tail = xw_raw[-hop:] if hop <= xw_raw.size else xw_raw
+            filt_tail = (x_use[-hop:] if hop <= x_use.size else x_use) if bp_ok else raw_tail
+
+            for i in range(len(t_tail)):
+                st.t_hf.append(float(t_tail[i]))
+                st.heart_f.append(float(filt_tail[i]))
+
+        x_filt_for_csv = x_use if bp_ok else xw_raw
+        _csv_enqueue_window(
+            st, win_id, t_center, fs, BP.get("on", 1), bp_ok, bp_err, tw, xw_raw, x_filt_for_csv
+        )
+        _csv_flush(st, force=False)
+
+        if not np.isfinite(hr):
+>>>>>>> 700179eff6dd2e0e3752e31b9a4aed0a0c305b57
             return
 
         with st.lock:
             for _ in range(hop):
+<<<<<<< HEAD
                 if st.t:
                     st.t.popleft()
                 if st.x_hr:
                     st.x_hr.popleft()
                 if st.x_br:
                     st.x_br.popleft()
+=======
+                if st.x:
+                    st.x.popleft()
+                    st.t.popleft()
+
+        done += 1
+
+>>>>>>> 700179eff6dd2e0e3752e31b9a4aed0a0c305b57
 
         done += 1
 
@@ -431,7 +607,11 @@ def process_if_possible(st: State, max_windows=2):
 # ===================== GUI =====================
 def make_gui():
     plt.ion()
+<<<<<<< HEAD
     fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
+=======
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
+>>>>>>> 700179eff6dd2e0e3752e31b9a4aed0a0c305b57
 
     # HR
     l_hr, = ax1.plot([], [], lw=1.5)
@@ -445,11 +625,21 @@ def make_gui():
     ax2.set_ylabel("BR (brpm)")
     ax2.grid(True)
 
+<<<<<<< HEAD
     # Fs
     l_fs, = ax3.plot([], [], lw=1.0)
     p_fs, = ax3.plot([], [], linestyle="none", marker="o", markersize=4)
     ax3.set_ylabel("Fs_win (Hz)")
+=======
+    l_tot, = ax3.plot([], [], lw=1.0)
+    l_bre, = ax3.plot([], [], lw=1.0)
+    l_hea, = ax3.plot([], [], lw=1.0)
+    l_hf,  = ax3.plot([], [], lw=1.5)
+    ax3.set_ylabel("phases (raw) + heart_filt")
+    ax3.set_xlabel("t (s)")
+>>>>>>> 700179eff6dd2e0e3752e31b9a4aed0a0c305b57
     ax3.grid(True)
+    ax3.legend(["total", "breath", "heart", "heart_filt"], loc="upper right")
 
     # raw
     l_tot, = ax4.plot([], [], lw=1.0)
@@ -461,11 +651,19 @@ def make_gui():
     ax4.legend(["total", "breath", "heart"], loc="upper right")
 
     fig.tight_layout()
+<<<<<<< HEAD
     return fig, (ax1, ax2, ax3, ax4), (l_hr, p_hr, l_br, p_br, l_fs, p_fs, l_tot, l_bre, l_hea)
 
 
 def gui_loop_mainthread(st: State, stop_event: threading.Event):
     fig, (ax1, ax2, ax3, ax4), (l_hr, p_hr, l_br, p_br, l_fs, p_fs, l_tot, l_bre, l_hea) = make_gui()
+=======
+    return fig, (ax1, ax2, ax3), (l_hr, p_hr, l_fs, p_fs, l_tot, l_bre, l_hea, l_hf)
+
+
+def gui_loop(st: State):
+    fig, (ax1, ax2, ax3), (l_hr, p_hr, l_fs, p_fs, l_tot, l_bre, l_hea, l_hf) = make_gui()
+>>>>>>> 700179eff6dd2e0e3752e31b9a4aed0a0c305b57
     period = 1.0 / GUI_REFRESH_HZ
 
     while plt.fignum_exists(fig.number) and (not stop_event.is_set()):
@@ -487,8 +685,17 @@ def gui_loop_mainthread(st: State, stop_event: threading.Event):
 
             th = np.asarray(st.t_heart, dtype=float)
             yh = np.asarray(st.heart, dtype=float)
+<<<<<<< HEAD
 
             good, bad, back = st.good, st.bad, st.ts_back
+=======
+
+            thf = np.asarray(st.t_hf, dtype=float)
+            yhf = np.asarray(st.heart_f, dtype=float)
+
+            good, bad, back = st.good, st.bad, st.ts_back
+            fok, ffl, ferr = st.filter_ok, st.filter_fail, st.filter_last_err
+>>>>>>> 700179eff6dd2e0e3752e31b9a4aed0a0c305b57
             csv_path = st.csv_path
 
         if t_hr.size > 0:
@@ -499,6 +706,7 @@ def gui_loop_mainthread(st: State, stop_event: threading.Event):
             l_br.set_data(t_br, y_br); p_br.set_data(t_br, y_br)
             ax2.relim(); ax2.autoscale_view()
 
+<<<<<<< HEAD
         if t_fs.size > 0:
             l_fs.set_data(t_fs, y_fs); p_fs.set_data(t_fs, y_fs)
             ax3.relim(); ax3.autoscale_view()
@@ -517,6 +725,26 @@ def gui_loop_mainthread(st: State, stop_event: threading.Event):
             f"HR_COL={CFG['HR_COL']}({_col_name(CFG['HR_COL'])}) band=[{CFG['hr_wi']:.2f},{CFG['hr_wf']:.2f}]Hz | "
             f"BR_COL={CFG['BR_COL']}({_col_name(CFG['BR_COL'])}) band=[{CFG['br_wi']:.2f},{CFG['br_wf']:.2f}]Hz | "
             f"csv={(csv_path if (CSV_ON and csv_path) else 'OFF')}"
+=======
+        if tt.size > 1:
+            l_tot.set_data(tt, yt)
+        if tb.size > 1:
+            l_bre.set_data(tb, yb)
+        if th.size > 1:
+            l_hea.set_data(th, yh)
+        if thf.size > 1:
+            l_hf.set_data(thf, yhf)
+
+        if (tt.size > 1) or (tb.size > 1) or (th.size > 1) or (thf.size > 1):
+            ax3.relim(); ax3.autoscale_view()
+
+        bp_txt = f"BP={'ON' if BP.get('on',1) else 'OFF'} {BP['wi']:.2f}-{BP['wf']:.2f}Hz Rs={BP['Rs']:.0f} ford={BP['ford']}"
+        filt_txt = f"bp_ok={fok} bp_fail={ffl}" + (f" last={ferr}" if (ffl > 0 and ferr) else "")
+        csv_txt = f"csv={csv_path}" if (CSV_ON and csv_path) else "csv=OFF"
+
+        ax1.set_title(
+            f"good={good} bad={bad} ts_back={back} | N={CFG['N']} hop={CFG['hop']} | {bp_txt} | {filt_txt} | {csv_txt}"
+>>>>>>> 700179eff6dd2e0e3752e31b9a4aed0a0c305b57
         )
 
         fig.canvas.draw()
@@ -540,6 +768,7 @@ def proc_loop(st: State, stop_event: threading.Event):
         time.sleep(0.005)
 
 
+<<<<<<< HEAD
 async def ble_async_main(st: State, stop_event: threading.Event):
     # valida colunas
     if int(CFG.get("HR_COL", 3)) not in (1, 2, 3):
@@ -548,6 +777,17 @@ async def ble_async_main(st: State, stop_event: threading.Event):
     if int(CFG.get("BR_COL", 2)) not in (1, 2, 3):
         print(f"[CFG] BR_COL inválido={CFG.get('BR_COL')}. Use 1=total,2=breath,3=heart. Vou usar 2.")
         CFG["BR_COL"] = 2
+=======
+async def main():
+    st = State()
+    _csv_init(st)
+
+    gui_thread = threading.Thread(target=gui_loop, args=(st,), daemon=True)
+    gui_thread.start()
+
+    proc_thread = threading.Thread(target=proc_loop, args=(st,), daemon=True)
+    proc_thread.start()
+>>>>>>> 700179eff6dd2e0e3752e31b9a4aed0a0c305b57
 
     print("Scanning BLE...")
     devices = await BleakScanner.discover(timeout=5.0)
@@ -593,8 +833,12 @@ async def ble_async_main(st: State, stop_event: threading.Event):
 
         with st.lock:
             st.t.append(t_sec)
+<<<<<<< HEAD
             st.x_hr.append(float(x_hr))
             st.x_br.append(float(x_br))
+=======
+            st.x.append(float(heart))
+>>>>>>> 700179eff6dd2e0e3752e31b9a4aed0a0c305b57
 
             st.t_total.append(t_sec);  st.total.append(float(total))
             st.t_breath.append(t_sec); st.breath.append(float(breath))
@@ -634,6 +878,7 @@ async def ble_async_main(st: State, stop_event: threading.Event):
         except Exception:
             pass
 
+<<<<<<< HEAD
     stop_event.set()
 
 
@@ -665,6 +910,11 @@ def main():
         stop_event.set()
 
     _csv_flush(st, force=True)
+=======
+        await client.stop_notify(CHAR_UUID)
+        _csv_flush(st, force=True)
+        print("Parou.")
+>>>>>>> 700179eff6dd2e0e3752e31b9a4aed0a0c305b57
 
 
 if __name__ == "__main__":
