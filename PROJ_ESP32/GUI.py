@@ -1,526 +1,445 @@
+import tkinter as tk
+from tkinter import ttk
+import threading
+import struct
+import serial
 import numpy as np
-import pandas as pd
+import queue
 import matplotlib.pyplot as plt
-
-from datetime import datetime
-from scipy.signal import cheby2, filtfilt
-from scipy.interpolate import PchipInterpolator
-
-# ========================== PATHS (3 DUPLAS) ==========================
-BASE = r"C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\\"
-DATASETS = [
-    {"name": "H2",  "radar": BASE + "phases.csv",     "polar": BASE + "POLARH2.txt"},
-    {"name": "H3",  "radar": BASE + "phases_raw.csv", "polar": BASE + "POLARH3.txt"},
-    {"name": "H10", "radar": BASE + "phase.csv",      "polar": BASE + "POLARH10.txt"},
-]
-
-# ===================== FIXOS =====================
-GAP_THR_SEC = 0.6
-FS_TARGET   = 25.0
-
-COL_T_MS  = 0
-COL_HEART = 1
-
-DT_GRID       = 0.1
-SMOOTH_HR_SEC = 7.0
-F_MIN_HZ      = 0.05
-
-MIN_POINTS_AFTER_RESAMPLE = 32
-MIN_METRIC_SAMPLES        = 10
-
-# ===================== CFG DEFINITIVA =====================
-CFG = {
-    "N": 32,
-    "hop": 16,
-    "WRAP": 0,
-
-    "win": "flattop",   # fixo
-    "ftype": "cheby2",  # fixo
-    "ford": 4,          # par
-    "wi": 0.80,
-    "wf": 2.00,
-
-    "harm_on": 1,
-    "harm_max": 3,
-    "harm_tol": 1,
-    "harm_ratio": 0.20,
-}
-
-PLOT_ON = True
-PLOT_NONBLOCK = True
-
-
-# ========================== FUNÇÕES ==========================
-def _extract_floats_from_line(line: str):
-    # extrai floats estilo readmatrix (pega inclusive notação científica)
-    # sem usar regex (pra ficar leve): troca separadores por espaço e split
-    for ch in [",", ";", "\t", "|"]:
-        line = line.replace(ch, " ")
-    parts = line.strip().split()
-    vals = []
-    for p in parts:
-        try:
-            vals.append(float(p))
-        except Exception:
-            pass
-    return vals
-
-def read_radar_like_readmatrix(path):
-    # emula readmatrix: ignora linhas ruins e pega as 2 primeiras colunas numéricas
-    t_ms = []
-    x = []
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            vals = _extract_floats_from_line(line)
-            if len(vals) >= 2:
-                t_ms.append(vals[0])
-                x.append(vals[1])
-    t_ms = np.asarray(t_ms, dtype=float)
-    x = np.asarray(x, dtype=float)
-    return t_ms, x
-
-def interp1_index_linear_extrap(x):
-    # MATLAB:
-    # x(~ok)=interp1(find(ok),x(ok),find(~ok),'linear','extrap')
-    x = np.asarray(x, dtype=float).reshape(-1)
-    ok = np.isfinite(x)
-    if np.all(ok):
-        return x
-
-    idx_ok = np.flatnonzero(ok)
-    idx_q  = np.flatnonzero(~ok)
-    y_ok   = x[idx_ok]
-
-    if idx_ok.size == 0:
-        return np.zeros_like(x)
-
-    if idx_ok.size == 1:
-        x[idx_q] = y_ok[0]
-        return x
-
-    # interp dentro do range
-    x[idx_q] = np.interp(idx_q, idx_ok, y_ok)
-
-    # extrap linear à esquerda
-    left = idx_q[idx_q < idx_ok[0]]
-    if left.size > 0:
-        i0, i1 = idx_ok[0], idx_ok[1]
-        y0, y1 = y_ok[0], y_ok[1]
-        m = (y1 - y0) / (i1 - i0)
-        x[left] = y0 + m * (left - i0)
-
-    # extrap linear à direita
-    right = idx_q[idx_q > idx_ok[-1]]
-    if right.size > 0:
-        i0, i1 = idx_ok[-2], idx_ok[-1]
-        y0, y1 = y_ok[-2], y_ok[-1]
-        m = (y1 - y0) / (i1 - i0)
-        x[right] = y1 + m * (right - i1)
-
-    return x
-
-def prep_nowrap(x):
-    x = np.asarray(x, dtype=float).reshape(-1)
-    x = interp1_index_linear_extrap(x)
-    return x - np.nanmean(x)
-
-def wrap_phase(ph):
-    ph = np.asarray(ph, dtype=float).reshape(-1)
-    ph = interp1_index_linear_extrap(ph)
-    phw = (ph + np.pi) % (2*np.pi) - np.pi
-    return phw - np.nanmean(phw)
-
-def segment_by_gaps(t, gap_thr):
-    t = np.asarray(t, dtype=float).reshape(-1)
-    n = t.size
-    if n < 2:
-        return np.array([[0, max(0, n-1)]], dtype=int)
-    br = np.flatnonzero(np.diff(t) > gap_thr)
-    if br.size == 0:
-        return np.array([[0, n-1]], dtype=int)
-    starts = np.r_[0, br + 1]
-    ends   = np.r_[br, n-1]
-    return np.c_[starts, ends].astype(int)
-
-def resample_segments_irregular(t, x, segments, fs_target, method="linear"):
-    t = np.asarray(t, dtype=float).reshape(-1)
-    x = np.asarray(x, dtype=float).reshape(-1)
-    dt = 1.0 / fs_target
-
-    t_u_list, x_u_list = [], []
-
-    for i0, i1 in segments:
-        ts = t[i0:i1+1]
-        xs = x[i0:i1+1]
-
-        # unique(ts,'stable')
-        _, iu = np.unique(ts, return_index=True)
-        iu = np.sort(iu)
-        ts = ts[iu]
-        xs = xs[iu]
-
-        if ts.size < 4:
-            continue
-
-        # MATLAB: (ts(1):dt:ts(end))'
-        tnew = np.arange(ts[0], ts[-1] + 1e-12, dt)
-
-        if method == "pchip":
-            itp = PchipInterpolator(ts, xs, extrapolate=True)
-            xnew = itp(tnew)
-        else:
-            xnew = np.interp(tnew, ts, xs)
-
-        ok = np.isfinite(tnew) & np.isfinite(xnew)
-        if np.any(ok):
-            t_u_list.append(tnew[ok])
-            x_u_list.append(xnew[ok])
-
-    if not t_u_list:
-        return np.array([]), np.array([])
-
-    t_u = np.concatenate(t_u_list)
-    x_u = np.concatenate(x_u_list)
-
-    # unique(t_u,'stable')
-    _, iu = np.unique(t_u, return_index=True)
-    iu = np.sort(iu)
-    return t_u[iu], x_u[iu]
-
-def zero_phase_bandpass_cheby2(x, fs, wi_hz, wf_hz, order_final):
-    x = np.asarray(x, dtype=float).reshape(-1)
-    if x.size < 16:
-        return x
-    if wf_hz >= fs/2 or wi_hz <= 0 or wi_hz >= wf_hz or (order_final % 2) != 0:
-        return x
-
-    n = order_final // 2
-    Rs = 30.0
-    wn = np.array([wi_hz, wf_hz]) / (fs/2)
-
-    b, a = cheby2(n, Rs, wn, btype="bandpass", output="ba")
-
-    padlen = 3 * (max(len(a), len(b)) - 1)
-    if x.size <= padlen:
-        return x
-
-    return filtfilt(b, a, x)
-
-def flattopwin_periodic(N):
-    # MATLAB flattopwin(N,'periodic') (coef padrão)
-    # w[n] = a0 - a1*cos(2πn/N) + a2*cos(4πn/N) - a3*cos(6πn/N) + a4*cos(8πn/N)
-    a0 = 0.21557895
-    a1 = 0.41663158
-    a2 = 0.277263158
-    a3 = 0.083578947
-    a4 = 0.006947368
-    n = np.arange(N, dtype=float)
-    w = (a0
-         - a1*np.cos(2*np.pi*n/N)
-         + a2*np.cos(4*np.pi*n/N)
-         - a3*np.cos(6*np.pi*n/N)
-         + a4*np.cos(8*np.pi*n/N))
-    return w
-
-def parabolic_peak_interp_logP(P, k):
-    if k <= 0 or k >= (len(P) - 1):
-        return 0.0
-    la = np.log(P[k-1] + 1e-20)
-    lb = np.log(P[k]   + 1e-20)
-    lc = np.log(P[k+1] + 1e-20)
-    den = (la - 2*lb + lc)
-    if den == 0 or not np.isfinite(den):
-        return 0.0
-    d = 0.5 * (la - lc) / den
-    if not np.isfinite(d):
-        d = 0.0
-    return float(np.clip(d, -0.75, 0.75))
-
-def harmonic_guard_pick_subharmonic(P, k0, k_min, max_order, tol_bins, ratio_min):
-    # FIEL AO MATLAB (k_est sempre baseado no k0 original)
-    k_pick = int(k0)
-    P0 = P[k_pick]
-    if (not np.isfinite(P0)) or (P0 <= 0):
-        return k_pick
-
-    k0_base = int(k0)
-
-    for m in range(2, int(max_order) + 1):
-        k_est = int(np.round(k0_base / m))
-        if k_est < k_min:
-            continue
-
-        lo = max(int(k_min), k_est - int(tol_bins))
-        hi = min(len(P) - 1, k_est + int(tol_bins))
-        if hi < lo:
-            continue
-
-        seg = P[lo:hi+1]
-        idx = int(np.argmax(seg))
-        ksub = lo + idx
-        Psub = seg[idx]
-
-        if np.isfinite(Psub) and (Psub >= ratio_min * P0):
-            k_pick = ksub
-            P0 = Psub
-
-    return int(k_pick)
-
-def rfft_fundamental_track_hop(tu, xu, fs, nperseg, hop, f_min_hz,
-                               harm_on, harm_max, harm_tol, harm_ratio):
-    tu = np.asarray(tu, dtype=float).reshape(-1)
-    xu = np.asarray(xu, dtype=float).reshape(-1)
-
-    if xu.size < nperseg or tu.size != xu.size:
-        return np.array([]), np.array([])
-
-    # MATLAB: flattopwin(nperseg,'periodic')
-    win = flattopwin_periodic(nperseg)
-
-    nfft = nperseg
-    half = nfft//2 + 1
-
-    # MATLAB:
-    # k_min_mat = ceil(f_min*nfft/fs); k_min_mat=max(2,k_min_mat)
-    # python index = k_mat-1
-    k_min_mat = int(np.ceil(f_min_hz * nfft / fs))
-    k_min_mat = max(2, k_min_mat)
-    k_min = max(1, k_min_mat - 1)
-
-    t_frames = []
-    fpk_hz = []
-
-    idx0 = 0
-    while (idx0 + nperseg) <= xu.size:
-        xw = xu[idx0:idx0+nperseg] * win
-        xw = xw - np.nanmean(xw)
-
-        X = np.fft.rfft(xw, n=nfft)
-        P = np.abs(X[:half])**2
-
-        if k_min >= P.size:
-            idx0 += hop
-            continue
-
-        rel = int(np.argmax(P[k_min:]))
-        k0 = k_min + rel
-
-        if harm_on:
-            k0 = harmonic_guard_pick_subharmonic(P, k0, k_min, harm_max, harm_tol, harm_ratio)
-
-        delta = parabolic_peak_interp_logP(P, k0)
-
-        # MATLAB: f = (k0_mat - 1 + delta)*fs/nfft
-        # python: k0_py = k0_mat-1 => f = (k0_py + delta)*fs/nfft
-        f_est = (k0 + delta) * fs / nfft
-
-        t_center = tu[idx0] + 0.5*(nperseg-1)/fs
-
-        t_frames.append(t_center)
-        fpk_hz.append(f_est)
-
-        idx0 += hop
-
-    return np.asarray(t_frames), np.asarray(fpk_hz)
-
-def interp_common(t_src, y_src, t_dst, kind="linear"):
-    t_src = np.asarray(t_src, dtype=float).reshape(-1)
-    y_src = np.asarray(y_src, dtype=float).reshape(-1)
-    t_dst = np.asarray(t_dst, dtype=float).reshape(-1)
-
-    ok = np.isfinite(t_src) & np.isfinite(y_src)
-    out = np.full_like(t_dst, np.nan, dtype=float)
-    if np.count_nonzero(ok) < 2:
-        return out
-
-    ts = t_src[ok]
-    ys = y_src[ok]
-
-    iu = np.argsort(ts)
-    ts = ts[iu]
-    ys = ys[iu]
-
-    ts_u, ia = np.unique(ts, return_index=True)
-    ys_u = ys[ia]
-    if ts_u.size < 2:
-        return out
-
-    if kind == "pchip":
-        itp = PchipInterpolator(ts_u, ys_u, extrapolate=False)
-        out = itp(t_dst)
-    else:
-        out = np.interp(t_dst, ts_u, ys_u, left=np.nan, right=np.nan)
-
-    return out
-
-def smooth_in_time_to_grid(t_src, y_src, t_grid, dt_grid, smooth_sec):
-    y_i = interp_common(t_src, y_src, t_grid, kind="linear")
-    win_n = max(1, int(np.round(smooth_sec / dt_grid)))
-
-    m = np.isfinite(y_i).astype(float)
-    y0 = np.nan_to_num(y_i, nan=0.0)
-    ker = np.ones(win_n, dtype=float)
-
-    num = np.convolve(y0, ker, mode="same")
-    den = np.convolve(m,  ker, mode="same")
-
-    out = np.full_like(y_i, np.nan, dtype=float)
-    ok = den > 0
-    out[ok] = num[ok] / den[ok]
-    return out
-
-def metrics(yhat, yref):
-    yhat = np.asarray(yhat, dtype=float).reshape(-1)
-    yref = np.asarray(yref, dtype=float).reshape(-1)
-    m = np.isfinite(yhat) & np.isfinite(yref)
-    n = int(np.count_nonzero(m))
-    if n < 3:
-        return np.nan, np.nan, np.nan, n
-    e = yhat[m] - yref[m]
-    mae = float(np.mean(np.abs(e)))
-    rmse = float(np.sqrt(np.mean(e*e)))
-
-    yh = yhat[m]
-    yr = yref[m]
-    if np.std(yh) == 0 or np.std(yr) == 0:
-        r = np.nan
-    else:
-        r = float(np.corrcoef(yh, yr)[0, 1])
-    return mae, rmse, r, n
-
-def _parse_dt(s):
-    s = str(s).strip()
-    fmts = [
-        "%Y-%m-%dT%H:%M:%S.%f",
-        "%Y-%m-%d %H:%M:%S.%f",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
-    ]
-    for f in fmts:
-        try:
-            return datetime.strptime(s, f)
-        except Exception:
-            pass
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import csv
+import datetime
+
+
+
+# Global variables
+update_time = 100  # Time of update in ms
+decimal_round = 5
+running = False
+flag = 0
+buffer_size = 60    # In seconds
+update_frequency = 2    # Frequency with which the graphs in the main tab update
+fft_frequency = 12       # Frequency with which the FFT graphs in the second tab update
+sampling_frequency = 50.0  # Fixed 20Hz sampling rate
+fft_buffer_size = 1024    # Buffer size for the FFT
+
+# Buffers for graphs
+heart_phase_values = np.zeros(buffer_size)
+breath_phase_values = np.zeros(buffer_size)
+time_values = np.arange(-buffer_size + 1, 1, 1)
+
+def initialize_serial():
+    """Initialize the serial port."""
+    global serialPort
     try:
-        return datetime.fromisoformat(s.replace("Z", ""))
-    except Exception:
-        raise ValueError(f"Timestamp Polar inválido: {s}")
+        serialPort = serial.Serial(
+    port="COM5",
+    baudrate=1382400,
+    bytesize=serial.EIGHTBITS,
+    parity=serial.PARITY_NONE,
+    stopbits=serial.STOPBITS_TWO,
+    timeout=2
+)
 
-def read_txt_polar(path):
-    df = pd.read_csv(path, sep=";", header=0, usecols=[0, 1], engine="python")
-    ts = df.iloc[:, 0].astype(str).to_numpy()
-    hr = pd.to_numeric(df.iloc[:, 1], errors="coerce").to_numpy(dtype=float)
+        print("Serial port initialized successfully.")
+    except Exception as e:
+        print(f"Error initializing serial port: {e}")
 
-    ok = np.isfinite(hr)
-    ts = ts[ok]
-    hr = hr[ok]
-    if ts.size == 0:
-        return np.array([]), np.array([])
+class SerialReaderApp:
+    def __init__(self, root):        
+        self.root = root
+        self.root.title("Radar Data Reader")
+        self.queue = queue.Queue()        
 
-    tdt = np.array([_parse_dt(s) for s in ts], dtype=object)
-    t0 = tdt[0]
-    t_sec = np.array([(tt - t0).total_seconds() for tt in tdt], dtype=float)
+        # Create notebook (tabbed interface)
+        self.notebook = ttk.Notebook(root)
+        self.notebook.grid(row=0, column=0, sticky="nsew")
+        # First tab (main)
+        self.first_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.first_tab, text="Main View")
+        # Second tab (fft)
+        self.second_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.second_tab, text="FFT")
+        # Setups of the tabs
+        self.setup_first_tab()
+        self.setup_second_tab()
+            # self.setup_third_tab()
+        self.notebook.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
 
-    _, ia = np.unique(t_sec, return_index=True)
-    ia = np.sort(ia)
-    return t_sec[ia], hr[ia]
+        # FFT configs
+        self.fft_heart_buffer = np.zeros(fft_buffer_size)
+        self.fft_breath_buffer = np.zeros(fft_buffer_size)
 
 
-# ===================== RUN =====================
-print("\n==================== CONFIG DEFINITIVA ====================")
-print(f"N={CFG['N']} hop={CFG['hop']} WRAP={CFG['WRAP']} win={CFG['win']} | "
-      f"filt={CFG['ftype']} ord={CFG['ford']} wi={CFG['wi']:.2f} wf={CFG['wf']:.2f} | "
-      f"harm={CFG['harm_on']} (max={CFG['harm_max']} tol={CFG['harm_tol']} ratio={CFG['harm_ratio']:.2f})")
+        # Innitialize CSV file
+        self.csv_file = None
+        self.csv_writer = None
+        self.csv_filename = None
+        self.previous_timestamp = None
 
-Corrs, MAEs, RMSEs = [], [], []
-used = 0
+    def setup_first_tab(self):
+        # Configure main tab grid
+        self.first_tab.rowconfigure(0, weight=1)
+        self.first_tab.columnconfigure(0, weight=1)
 
-print("\n==================== RUN (DEFINITIVO) ====================")
-for ds in DATASETS:
-    print(f"\n[DATASET] {ds['name']}")
+        # Create the main frame with responsive layout
+        main_frame = ttk.Frame(self.first_tab)
+        main_frame.grid(row=0, column=0, sticky="nsew")
+        main_frame.columnconfigure(0, weight=3)  # Graphs take 3/4 of the width
+        main_frame.columnconfigure(1, weight=1)  # Labels take 1/4 of the width
+        main_frame.rowconfigure(0, weight=1)
 
-    # >>> aqui resolve o H3 (readmatrix-like)
-    t_ms, xraw = read_radar_like_readmatrix(ds["radar"])
-    if t_ms.size < 4:
-        print(" [SKIP] Radar vazio/poucos pontos.")
-        continue
+        # Left side: Graphs
+        graph_frame = ttk.Frame(main_frame)
+        graph_frame.grid(row=0, column=0, sticky="nsew")
 
-    t0 = (t_ms - t_ms[0]) / 1000.0
-    seg0 = segment_by_gaps(t0, GAP_THR_SEC)
+        self.buffer_size = int(buffer_size * 1000 / update_time)
+        global time_values, heart_phase_values, breath_phase_values
+        time_values = np.linspace(-buffer_size, 0, self.buffer_size)
+        heart_phase_values = np.zeros(self.buffer_size)
+        breath_phase_values = np.zeros(self.buffer_size)
 
-    try:
-        t_polar, HR_polar = read_txt_polar(ds["polar"])
-        hasPolar = (t_polar.size > 0) and (HR_polar.size > 0)
-    except Exception:
-        hasPolar = False
+        # Create the graphs
+        self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(6, 5), sharex=True)
+        self.ax1.set_title("Heart Phase", fontsize=10)
+        self.ax1.set_ylim(-8, 8)
+        self.ax1.set_xlim(-buffer_size, 0)
+        self.ax1.grid(True, linestyle='--', alpha=0.5)
+        self.ax2.set_title("Breath Phase", fontsize=10)
+        self.ax2.set_ylim(-8, 8)
+        self.ax2.set_xlabel("Time (seconds)", fontsize=10)
+        self.ax2.set_xlim(-buffer_size, 0)
+        self.ax2.grid(True, linestyle='--', alpha=0.5)
+        self.line1, = self.ax1.plot(time_values, heart_phase_values, "r-", linewidth=1.5)
+        self.line2, = self.ax2.plot(time_values, breath_phase_values, "b-", linewidth=1.5)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=graph_frame)
+        canvas_widget = self.canvas.get_tk_widget()
+        canvas_widget.pack(fill=tk.BOTH, expand=True)
 
-    if not hasPolar:
-        print(" [SKIP] Polar indisponível.")
-        continue
+        # Right side: Labels (Squares)
+        square_frame = ttk.Frame(main_frame)
+        square_frame.grid(row=0, column=1, sticky="nsew", rowspan=6, padx=10)
+        square_frame.columnconfigure(0, weight=1)
 
-    x0 = wrap_phase(xraw) if CFG["WRAP"] else prep_nowrap(xraw)
+        self.square_labels = []
+        for i, label_text in enumerate(["Heart:", "Breath:", "Total:", "Distance:"]):
+            label = tk.Label(
+                square_frame,
+                bg="#f0f0f0",
+                font=("Arial", 14, "bold"),
+                fg="black",
+                borderwidth=2,
+                relief="solid",
+                width=20,
+                height=3,
+                anchor="center",
+            )
+            label.config(text=f"{label_text}\n0.00000")
+            label.grid(row=i, column=0, pady=5, sticky="ew")
+            self.square_labels.append(label)
 
-    t_u, x_u = resample_segments_irregular(t0, x0, seg0, FS_TARGET, method="linear")
-    if x_u.size < max(MIN_POINTS_AFTER_RESAMPLE, CFG["N"]):
-        print(f" [SKIP] Poucos pontos após resample: {x_u.size}")
-        continue
+        # Add buttons under the labels
+        square_frame.rowconfigure(4, weight=1)
+        square_frame.rowconfigure(5, weight=1)
 
-    x_f = zero_phase_bandpass_cheby2(x_u, FS_TARGET, CFG["wi"], CFG["wf"], CFG["ford"])
+        # Start Button (Row 4)
+        self.start_button = tk.Button(
+            square_frame,
+            text="Start Serial",
+            command=self.start_plotting,
+            bg="yellowgreen",
+            activebackground="lightgreen",
+            font=("Arial", 14, "bold"),
+            fg="black",
+            borderwidth=2,
+            relief="solid",
+            width=20,
+            height=3
+        )
+        
+        self.start_button.grid(row=4, column=0, pady=5, sticky="ew")
 
-    t_frames, f_hz = rfft_fundamental_track_hop(
-        t_u, x_f, FS_TARGET,
-        CFG["N"], CFG["hop"], F_MIN_HZ,
-        CFG["harm_on"], CFG["harm_max"], CFG["harm_tol"], CFG["harm_ratio"]
-    )
+        # Stop Button (Row 5)
+        self.stop_button = tk.Button(
+            square_frame,
+            text="Stop Serial",
+            command=self.stop_plotting,
+            bg="tomato",
+            activebackground="coral",
+            font=("Arial", 14, "bold"),
+            fg="black",
+            borderwidth=2,
+            relief="solid",
+            width=20,
+            height=3
+        )
+        self.stop_button.grid(row=5, column=0, pady=5, sticky="ew")
+        self.start_button.config(state=tk.NORMAL)
+        self.stop_button.config(state=tk.DISABLED)
 
-    if t_frames.size == 0:
-        print(" [SKIP] Track vazio.")
-        continue
+        # Log area
+        log_frame = ttk.Frame(self.first_tab)
+        log_frame.grid(row=1, column=0, sticky="nsew")
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
 
-    hr_bpm = 60.0 * f_hz
+        self.text_log = tk.Text(log_frame, height=6, state=tk.DISABLED, wrap=tk.NONE)
+        self.text_log.grid(row=0, column=0, sticky="nsew")
+        scrollbar_x = ttk.Scrollbar(log_frame, orient=tk.HORIZONTAL, command=self.text_log.xview)
+        scrollbar_x.grid(row=1, column=0, sticky="ew")
+        scrollbar_y = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.text_log.yview)
+        scrollbar_y.grid(row=0, column=1, sticky="ns")
+        self.text_log.config(xscrollcommand=scrollbar_x.set, yscrollcommand=scrollbar_y.set)
 
-    t_start = max(np.min(t_frames), np.min(t_polar))
-    t_end   = min(np.max(t_frames), np.max(t_polar))
-    if not (np.isfinite(t_start) and np.isfinite(t_end) and (t_end > t_start)):
-        print(" [SKIP] Janela comum inválida.")
-        continue
+        # Start the serial reading thread
+        self.thread = threading.Thread(target=self.read_serial_thread, daemon=True)
+        self.thread.start()
 
-    t_common = np.arange(t_start, t_end + 1e-12, DT_GRID)
+        # Start the UI update loop
+        self.update_counter = 0  # Counter to control graph redraw frequency
+        self.update_ui()
 
-    HR_radar_grid = smooth_in_time_to_grid(t_frames, hr_bpm, t_common, DT_GRID, SMOOTH_HR_SEC)
-    HR_polar_grid = interp_common(t_polar, HR_polar, t_common, kind="linear")
+    def setup_second_tab(self):        
+        """Setup the FFT analysis tab"""
+        # Configure grid for second tab
+        self.second_tab.columnconfigure(0, weight=1)
+        self.second_tab.rowconfigure(0, weight=1)
 
-    MAE, RMSE, R, n = metrics(HR_radar_grid, HR_polar_grid)
-    if not (np.isfinite(MAE) and np.isfinite(R) and (n >= MIN_METRIC_SAMPLES)):
-        print(f" [SKIP] Métrica inválida (n={n}).")
-        continue
+        # Create the main frame with responsive layout
+        main_fft_frame = ttk.Frame(self.second_tab)
+        main_fft_frame.grid(row=0, column=0, sticky="nsew")
+        main_fft_frame.columnconfigure(0, weight=3)  # Graphs take 3/4 of the width
+        main_fft_frame.columnconfigure(1, weight=1)  # Labels take 1/4 of the width
+        main_fft_frame.rowconfigure(0, weight=1)
 
-    used += 1
-    Corrs.append(R)
-    MAEs.append(MAE)
-    RMSEs.append(RMSE)
+        # Left side: FFT Graphs
+        graph_frame = ttk.Frame(main_fft_frame)
+        graph_frame.grid(row=0, column=0, sticky="nsew")
 
-    print(f" OK | corr={R:.4f} | MAE={MAE:.3f} | RMSE={RMSE:.3f} | n={n}")
+        # Create the graphs
+        self.fig, (self.bpm, self.brpm) = plt.subplots(2, 1, figsize=(5, 2), sharex=True)
+        self.bpm.set_title("FFT of the Heart Phase Graph", fontsize=10)
+        self.bpm.set_ylim(0, 5)
+        self.bpm.set_xlim(0, 10)
+        self.bpm.grid(True, linestyle='--', alpha=0.5)
+        self.brpm.set_title("FFT of the Breath Phase Graph", fontsize=10)
+        self.brpm.set_ylim(0, 5)
+        self.brpm.set_xlim(0, 10)
+        self.brpm.set_xlabel("Frequency (Hz)", fontsize=10)
+        self.brpm.grid(True, linestyle='--', alpha=0.5)
+        self.line1, = self.bpm.plot(time_values, heart_phase_values, "r-", linewidth=1.5)
+        self.line2, = self.brpm.plot(time_values, breath_phase_values, "b-", linewidth=1.5)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=graph_frame)
+        canvas_widget = self.canvas.get_tk_widget()
+        canvas_widget.pack(fill=tk.BOTH, expand=True)
 
-    if PLOT_ON:
-        plt.figure(figsize=(10, 4))
-        plt.plot(t_common, HR_polar_grid, label="Polar (grid)")
-        plt.plot(t_common, HR_radar_grid, label="Radar (grid)")
-        plt.grid(True)
-        plt.xlabel("t (s)")
-        plt.ylabel("HR (bpm)")
-        plt.title(f"DEFINITIVO {ds['name']} | corr={R:.3f} MAE={MAE:.2f} RMSE={RMSE:.2f}")
-        plt.legend()
-        plt.tight_layout()
-        if PLOT_NONBLOCK:
-            plt.show(block=False)
-            plt.pause(0.01)
-        else:
-            plt.show()
 
-print("\n==================== SUMMARY ====================")
-if used == 0:
-    print("Nenhum dataset válido.")
-else:
-    print(f"Datasets usados: {used}/{len(DATASETS)}")
-    print(f"corr_mean={np.mean(Corrs):.4f} | MAE_mean={np.mean(MAEs):.3f} | RMSE_mean={np.mean(RMSEs):.3f}")
+
+        
+        
+        # Initialize FFT data buffers
+        self.bpm_heart_line, = self.bpm.plot([], [], "r-", label="Heart", linewidth=1.5)
+        self.brpm_breath_line, = self.brpm.plot([], [], "b-", label="Breath", linewidth=1.5)
+        
+        # Right column placeholder (toggle menu area)
+        placeholder_label = ttk.Label(self.second_tab, text="Toggle menu will go here.")
+        placeholder_label.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=10, pady=10)
+        
+    def start_plotting(self):
+        """Start the serial reading process."""
+        global running
+        if not running:
+            running = True
+            self.start_button.config(state=tk.DISABLED)
+            self.stop_button.config(state=tk.NORMAL)
+            print("Starting serial reading...")
+
+            # Create a new CSV file
+            now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            self.csv_filename = f"radar_data_{now}.csv"
+            self.csv_file = open(self.csv_filename, mode="w", newline="")
+            self.csv_writer = csv.writer(self.csv_file)
+            self.csv_writer.writerow(["Timestamp", "HeartPhase", "BreathPhase", "TotalPhase", "Distance"])
+            self.current_data = {}
+            self.update_ui()
+
+    def stop_plotting(self):
+        global running
+        if running:
+            running = False
+            self.stop_button.config(state=tk.DISABLED)
+            self.start_button.config(state=tk.NORMAL)
+            print("Stopping serial reading...")
+
+             # Close the CSV file
+            if self.csv_file:
+                self.csv_file.close()
+                print(f"Data saved to {self.csv_filename}")
+            
+    def read_serial_thread(self):
+        """Read data from the serial port in a separate thread."""
+        global flag, heart_phase_values, breath_phase_values, running
+        while True:
+            try:
+                byte = serialPort.read(1)
+                if byte == b'\x0A':
+                    next_byte = serialPort.read(1)
+                    if next_byte == b'\x14':
+                        flag = 0
+                    elif next_byte == b'\x13':
+                        data = serialPort.read(13)
+                        TotalPhase = struct.unpack('<f', data[1:5])[0]
+                        BreathPhase = struct.unpack('<f', data[5:9])[0]
+                        HeartPhase = struct.unpack('<f', data[9:13])[0]
+                        if running:                            
+                            self.current_data["timestamp"] = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                            self.current_data["HeartPhase"] = HeartPhase
+                            self.current_data["BreathPhase"] = BreathPhase
+                            self.current_data["TotalPhase"] = TotalPhase
+                            self.queue.put({
+                                "type": "data",
+                                "message": f"Breath: {BreathPhase}, Heart: {HeartPhase}, Total: {TotalPhase}\n",
+                                "HeartPhase": HeartPhase,
+                                "BreathPhase": BreathPhase,
+                                "TotalPhase": TotalPhase
+                            })
+
+                            # Update the buffers for the graphs
+                            heart_phase_values[:-1] = heart_phase_values[1:]
+                            heart_phase_values[-1] = HeartPhase
+                            breath_phase_values[:-1] = breath_phase_values[1:]
+                            breath_phase_values[-1] = BreathPhase
+                        flag = 1
+                    elif next_byte == b'\x16' and flag == 1:
+                        data = serialPort.read(9)
+                        Distance = struct.unpack('<f', data[5:9])[0]
+                        if running:
+                            self.current_data["Distance"] = Distance
+                            self.queue.put({
+                                "type": "distance",
+                                "message": f"Distance: {Distance}\n",
+                                "Distance": Distance
+                            })
+                            # Write the csv with all the data from the port
+                            if self.csv_writer and all(k in self.current_data for k in ("timestamp", "HeartPhase", "BreathPhase", "TotalPhase", "Distance")):
+                                current_time = datetime.datetime.strptime(self.current_data["timestamp"], "%H:%M:%S.%f")
+                                self.csv_writer.writerow([
+                                    self.current_data["timestamp"],
+                                    self.current_data["HeartPhase"],
+                                    self.current_data["BreathPhase"],
+                                    self.current_data["TotalPhase"],
+                                    self.current_data["Distance"]
+                                ])
+                                self.previous_timestamp = current_time  # Update last timestamp
+                                self.current_data = {}  # Clear buffer
+
+            except Exception as e:
+                self.queue.put({"type": "error", "message": f"Error reading serial data: {e}\n"})
+
+    def update_ui(self):
+        global running
+        """Update the UI with new data from the queue."""
+        
+        while not self.queue.empty():
+            item = self.queue.get()
+            if item["type"] == "data":
+                if running:
+                    # Update labels
+                    self.update_square_labels(item["HeartPhase"], item["BreathPhase"], item["TotalPhase"], None)
+            elif item["type"] == "distance":
+                if running:
+                    # Update only the distance label
+                    self.square_labels[3].config(text=f"Distance:\n{round(item['Distance'], decimal_round)}")
+
+            # Log message (limit log size to 500 lines)
+            self.text_log.config(state=tk.NORMAL)
+            self.text_log.insert(tk.END, item["message"])
+            if float(self.text_log.index('end-1c')) > 500:  # Keep max 500 lines
+                self.text_log.delete("1.0", "2.0")
+            self.text_log.config(state=tk.DISABLED)
+            self.text_log.yview(tk.END)
+
+        if running:
+            if self.update_counter % fft_frequency == 0 and self.notebook.index(self.notebook.select()) == 1:
+                self.update_fft()
+            # Update the graphs efficiently (redraw every 2 updates)
+            self.update_counter += 1
+            if self.update_counter % update_frequency == 0:
+                self.line1.set_ydata(heart_phase_values)
+                self.line2.set_ydata(breath_phase_values)
+                self.canvas.draw_idle()  # Use draw_idle for better performance
+
+        self.root.after(update_time, self.update_ui)
+    
+    def update_fft(self):
+        """Calculate and display FFT using sliding window approach"""
+        try:
+            half_buffer = fft_buffer_size // 2
+        
+            # Update buffers with 50% overlap
+            self.fft_heart_buffer[:half_buffer] = self.fft_heart_buffer[half_buffer:]
+            self.fft_breath_buffer[:half_buffer] = self.fft_breath_buffer[half_buffer:]
+            self.fft_heart_buffer[half_buffer:] = heart_phase_values[-half_buffer:]
+            self.fft_breath_buffer[half_buffer:] = breath_phase_values[-half_buffer:]
+            
+            # Calculate FFT
+            heart_fft = np.abs(np.fft.rfft(self.fft_heart_buffer)) / fft_buffer_size
+            breath_fft = np.abs(np.fft.rfft(self.fft_breath_buffer)) / fft_buffer_size
+            freqs = np.fft.rfftfreq(fft_buffer_size, 1/sampling_frequency)
+
+            # Find peaks
+            heart_peak_idx = np.argmax(heart_fft)
+            breath_peak_idx = np.argmax(breath_fft)
+            heart_peak_freq = freqs[heart_peak_idx]
+            breath_peak_freq = freqs[breath_peak_idx]
+            
+            # Update FFT plot
+            self.fft_heart_line.set_data(freqs, heart_fft)
+            self.fft_breath_line.set_data(freqs, breath_fft)
+            self.bpm.legend(loc="upper right", fontsize=8)
+            self.brpm.legend(loc="upper right", fontsize=8)
+            self.canvas.draw_idle()
+            
+        except Exception as e:
+            print(f"Error updating FFT: {e}")
+            
+
+    def update_square_labels(self, HeartPhase, BreathPhase, TotalPhase, Distance):
+        """Update the square labels with the latest values."""
+        self.square_labels[0].config(text=f"Heart:\n{round(HeartPhase, decimal_round)}")
+        self.square_labels[1].config(text=f"Breath:\n{round(BreathPhase, decimal_round)}")
+        self.square_labels[2].config(text=f"Total:\n{round(TotalPhase, decimal_round)}")
+        if Distance is not None:
+            self.square_labels[3].config(text=f"Distance:\n{round(Distance, decimal_round)}")
+
+    def on_close(self):
+        """Handle application shutdown."""
+        global running
+        running = False
+        if serialPort and serialPort.is_open:
+            serialPort.close()
+        if self.csv_file:
+            self.csv_file.close()
+        self.root.quit()
+        self.root.destroy()
+
+def create_gui():
+    """Create and configure the GUI."""
+    global root
+    root = tk.Tk()
+    root.geometry("1200x800")
+    root.rowconfigure(0, weight=4)
+    root.rowconfigure(1, weight=1)
+    root.columnconfigure(0, weight=1)
+    app = SerialReaderApp(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_close)
+    return root
+
+def main():
+    """Main function to initialize and run the application."""
+    initialize_serial()
+    root = create_gui()
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
