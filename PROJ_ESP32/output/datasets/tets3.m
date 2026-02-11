@@ -1,9 +1,9 @@
 clc; clear; close all;
 
 %% ===================== PATHS =====================
-CSV_PATH      = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\phases.csv';
-POLAR_HR_PATH = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\POLARH2.txt';
-TES_PATH      = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\tes.csv';   % formato: t_sec,HR
+CSV_PATH      = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\phases_raw.csv';
+POLAR_HR_PATH = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\POLARH3.txt';
+TES_PATH      = 'C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\tes.csv';   % formato: t_sec,HR
 
 %% ===================== CSV COLUNAS =====================
 COL_T_MS  = 1;
@@ -21,7 +21,7 @@ WRAP_ON   = 0;         % 1: wrap+mean | 0: mean apenas
 FLOW = 'BP_THEN_GATE'; % 'BP_THEN_GATE' ou 'GATE_THEN_BP'
 
 % GATE
-GATE_ON      = 0;
+GATE_ON      = 1;
 HR_MIN_BPM   = 65;
 HR_MAX_BPM   = 210;
 DELTA_DB     = -5;
@@ -29,7 +29,7 @@ SMOOTH_BINS  = 3;
 GATE_FLOOR   = 0.0;
 
 % BP (BUTTER SOS)
-BP_ON     = 0;
+BP_ON     = 1;
 BP_ORDER  = 2;
 BP_WI     = 0.3;   % Hz  (SEM CLAMP. usa isto mesmo.)
 BP_WF     = 2.5;       % Hz
