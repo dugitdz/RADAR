@@ -3,6 +3,10 @@ import struct
 import time
 import threading
 from collections import deque
+from queue import Queue, Empty
+import os
+import csv
+from datetime import datetime
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -15,15 +19,22 @@ from scipy.signal import cheby2, sosfilt, sosfilt_zi
 DEVICE_NAME = "ESP32C3_IC"
 CHAR_UUID   = "00001234-0000-1000-8000-00805f9b34fb"
 
+# ===================== CSV CONFIG =====================
+CSV_DIR  = r"C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\HR_BR"
+CSV_ON   = 1
+CSV_FLUSH_EVERY = 50  # flush a cada N linhas
+
 # ===================== CONFIG =====================
 CFG = dict(
     # quais canais do pacote usar (1=total,2=breath,3=heart)
-    HR_COL=3,
+    HR_COL=1,
     BR_COL=2,
 
-    # tracker (mesmo N/hop pros dois, por simplicidade)
-    N=512,
-    hop=64,
+    # tracker (N/hop separados)
+    N=512,        # HR
+    hop=64,       # HR
+    N_BR=512,     # BR
+    hop_BR=64,    # BR
 
     # "fs" assumido pelo tracker (sem resample)
     FS_TARGET=50.0,
@@ -132,12 +143,6 @@ def parabolic_peak(P, k):
 
 
 class RealtimeTracker:
-    """
-    Tracker causal por janelas:
-    - acumula N amostras
-    - a cada hop, calcula FFT, aplica prior e gera estimativa
-    - EMA no output
-    """
     def __init__(self, fs, N, hop, f_min_hz,
                  prior_init_per_min, prior_min_per_min, prior_max_per_min,
                  prior_sigma_hz, prior_alpha, ema_tau_sec):
@@ -183,7 +188,6 @@ class RealtimeTracker:
         self.tbuf.clear()
         self._cnt = 0
         self.ema_state = None
-        # mantém histórico de saída (você pode limpar se quiser)
 
     def push(self, t, x):
         self.buf.append(float(x))
@@ -222,7 +226,6 @@ class RealtimeTracker:
         else:
             self.ema_state = (1 - self.ema_alpha) * self.ema_state + self.ema_alpha * y_inst_per_min
 
-        # atualiza prior
         f_clipped = np.clip(f_est, self.prior_min, self.prior_max)
         self.f_prev = (1 - self.prior_alpha) * self.f_prev + self.prior_alpha * f_clipped
 
@@ -230,6 +233,29 @@ class RealtimeTracker:
         self.t_out.append(float(t_center))
         self.y_out.append(float(self.ema_state))
         return float(self.ema_state)
+
+
+# ===================== CSV WRITER =====================
+def csv_writer_thread(st, q: Queue, out_path: str):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    n_written = 0
+
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f, delimiter=",")
+        w.writerow(["t", "BR", "HR"])  # 3 colunas
+
+        while (not st.stop_event.is_set()) or (not q.empty()):
+            try:
+                row = q.get(timeout=0.2)
+            except Empty:
+                continue
+
+            w.writerow(row)
+            n_written += 1
+            if (CSV_FLUSH_EVERY > 0) and (n_written % CSV_FLUSH_EVERY == 0):
+                f.flush()
+
+        f.flush()
 
 
 # ===================== STATE =====================
@@ -260,20 +286,17 @@ class State:
         self.t_br = deque(maxlen=MAXP)
         self.br   = deque(maxlen=MAXP)
 
-        # init DSP objects
         self._init_dsp_objects()
 
     def _init_dsp_objects(self):
         fs = CFG["FS_TARGET"]
 
-        # HR filter
         sos_h, zi_h, err_h = design_sos_cheby2(
             fs, CFG["HR_FILT_ORD"], CFG["HR_FILT_WI"], CFG["HR_FILT_WF"], CFG["HR_FILT_RS"]
         )
         if sos_h is None:
             raise SystemExit(f"HR filter error: {err_h}")
 
-        # BR filter
         sos_b, zi_b, err_b = design_sos_cheby2(
             fs, CFG["BR_FILT_ORD"], CFG["BR_FILT_WI"], CFG["BR_FILT_WF"], CFG["BR_FILT_RS"]
         )
@@ -288,12 +311,11 @@ class State:
         self.zi_br0 = zi_b.copy()
         self.zi_br  = zi_b.copy()
 
-        N = CFG["N"]
-        hop = CFG["hop"]
         fmin = CFG["F_MIN_HZ"]
 
+        # HR tracker (N/hop)
         self.trk_hr = RealtimeTracker(
-            fs=fs, N=N, hop=hop, f_min_hz=fmin,
+            fs=fs, N=CFG["N"], hop=CFG["hop"], f_min_hz=fmin,
             prior_init_per_min=CFG["HR_PRIOR_INIT_BPM"],
             prior_min_per_min=CFG["HR_PRIOR_MIN_BPM"],
             prior_max_per_min=CFG["HR_PRIOR_MAX_BPM"],
@@ -302,8 +324,9 @@ class State:
             ema_tau_sec=CFG["HR_EMA_TAU_SEC"],
         )
 
+        # BR tracker (N_BR/hop_BR)
         self.trk_br = RealtimeTracker(
-            fs=fs, N=N, hop=hop, f_min_hz=fmin,
+            fs=fs, N=CFG["N_BR"], hop=CFG["hop_BR"], f_min_hz=fmin,
             prior_init_per_min=CFG["BR_PRIOR_INIT_BRPM"],
             prior_min_per_min=CFG["BR_PRIOR_MIN_BRPM"],
             prior_max_per_min=CFG["BR_PRIOR_MAX_BRPM"],
@@ -313,7 +336,6 @@ class State:
         )
 
     def reset_segment(self, x_hr_init=0.0, x_br_init=0.0):
-        # reseta estados do filtro (zi) e tracker
         self.zi_hr = self.zi_hr0 * float(x_hr_init)
         self.zi_br = self.zi_br0 * float(x_br_init)
         self.trk_hr.reset()
@@ -325,19 +347,16 @@ def make_gui():
     plt.ion()
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
 
-    # HR
     l_hr, = ax1.plot([], [], lw=1.5)
     p_hr, = ax1.plot([], [], linestyle="none", marker="o", markersize=4)
     ax1.set_ylabel("HR (bpm)")
     ax1.grid(True)
 
-    # BR
     l_br, = ax2.plot([], [], lw=1.5)
     p_br, = ax2.plot([], [], linestyle="none", marker="o", markersize=4)
     ax2.set_ylabel("BR (brpm)")
     ax2.grid(True)
 
-    # raw + filt
     l_h_r, = ax3.plot([], [], lw=1.0)
     l_b_r, = ax3.plot([], [], lw=1.0)
     l_h_f, = ax3.plot([], [], lw=1.5)
@@ -389,7 +408,7 @@ def gui_loop_mainthread(st: State):
 
         ax1.set_title(
             f"good={good} bad={bad} gaps={gaps} ts_back={back} | "
-            f"N={CFG['N']} hop={CFG['hop']} fs={CFG['FS_TARGET']:.2f} | "
+            f"HR: N={CFG['N']} hop={CFG['hop']} | BR: N_BR={CFG['N_BR']} hop_BR={CFG['hop_BR']} | fs={CFG['FS_TARGET']:.2f} | "
             f"HR_COL={CFG['HR_COL']}({_col_name(CFG['HR_COL'])}) BP=[{CFG['HR_FILT_WI']:.3f},{CFG['HR_FILT_WF']:.3f}]Hz | "
             f"BR_COL={CFG['BR_COL']}({_col_name(CFG['BR_COL'])}) BP=[{CFG['BR_FILT_WI']:.3f},{CFG['BR_FILT_WF']:.3f}]Hz"
         )
@@ -406,7 +425,7 @@ def gui_loop_mainthread(st: State):
 
 
 # ===================== BLE THREAD (async) =====================
-async def ble_async_main(st: State):
+async def ble_async_main(st: State, csv_q: Queue):
     print("Scanning BLE...")
     devices = await BleakScanner.discover(timeout=5.0)
 
@@ -438,12 +457,10 @@ async def ble_async_main(st: State):
 
         t_sec = (float(t_ms) - float(st.t0_ms)) / 1000.0
 
-        # timestamp indo pra trás (debug)
         with st.lock:
             if st.last_t_sec is not None and t_sec < st.last_t_sec:
                 st.ts_back += 1
 
-        # gap -> novo segmento
         gap = False
         with st.lock:
             if st.last_t_sec is not None and (t_sec - st.last_t_sec) > float(CFG["GAP_THR"]):
@@ -454,23 +471,19 @@ async def ble_async_main(st: State):
         x_hr_raw = _pick_signal_by_col(total, breath, heart, int(CFG["HR_COL"]))
         x_br_raw = _pick_signal_by_col(total, breath, heart, int(CFG["BR_COL"]))
 
-        # reset segmento (filtros + trackers)
         if gap:
             with st.lock:
                 st.reset_segment(x_hr_init=x_hr_raw, x_br_init=x_br_raw)
 
-        # filtros causais sample-by-sample
         with st.lock:
             y_hr, st.zi_hr = sosfilt(st.sos_hr, [x_hr_raw], zi=st.zi_hr)
             y_br, st.zi_br = sosfilt(st.sos_br, [x_br_raw], zi=st.zi_br)
             y_hr = float(y_hr[0])
             y_br = float(y_br[0])
 
-            # tracker
             hr_est = st.trk_hr.push(t_sec, y_hr)
             br_est = st.trk_br.push(t_sec, y_br)
 
-            # buffers pra plot
             st.t_raw.append(t_sec)
             st.heart_r.append(float(x_hr_raw))
             st.breath_r.append(float(x_br_raw))
@@ -480,10 +493,16 @@ async def ble_async_main(st: State):
             if hr_est is not None:
                 st.t_hr.append(st.trk_hr.t_out[-1])
                 st.hr.append(st.trk_hr.y_out[-1])
+                if CSV_ON:
+                    # linha: t, BR, HR (sem interpolar -> BR NaN)
+                    csv_q.put((float(st.trk_hr.t_out[-1]), float("nan"), float(st.trk_hr.y_out[-1])))
 
             if br_est is not None:
                 st.t_br.append(st.trk_br.t_out[-1])
                 st.br.append(st.trk_br.y_out[-1])
+                if CSV_ON:
+                    # linha: t, BR, HR (sem interpolar -> HR NaN)
+                    csv_q.put((float(st.trk_br.t_out[-1]), float(st.trk_br.y_out[-1]), float("nan")))
 
             st.good += 1
             good = st.good
@@ -491,8 +510,8 @@ async def ble_async_main(st: State):
         if good % DEBUG_EVERY_N == 0:
             print(
                 f"[OK] t={t_sec:8.3f}s | "
-                f"HRraw={x_hr_raw:+.3f} HRf={y_hr:+.3f} HR={(st.hr[-1] if len(st.hr)>0 else np.nan):6.2f} | "
-                f"BRraw={x_br_raw:+.3f} BRf={y_br:+.3f} BR={(st.br[-1] if len(st.br)>0 else np.nan):6.2f}"
+                f"HR={(st.hr[-1] if len(st.hr)>0 else np.nan):6.2f} | "
+                f"BR={(st.br[-1] if len(st.br)>0 else np.nan):6.2f}"
             )
 
     print("Conectando em:", target.address, target.name)
@@ -517,9 +536,9 @@ async def ble_async_main(st: State):
                 pass
 
 
-def ble_thread_entry(st: State):
+def ble_thread_entry(st: State, csv_q: Queue):
     try:
-        asyncio.run(ble_async_main(st))
+        asyncio.run(ble_async_main(st, csv_q))
     except KeyboardInterrupt:
         st.stop_event.set()
     except Exception:
@@ -530,14 +549,26 @@ def ble_thread_entry(st: State):
 def main():
     # valida cfg básica
     if int(CFG["N"]) < 32 or int(CFG["hop"]) < 1 or int(CFG["hop"]) > int(CFG["N"]):
-        raise SystemExit("CFG inválido: verifique N/hop")
+        raise SystemExit("CFG inválido (HR): verifique N/hop")
+    if int(CFG["N_BR"]) < 32 or int(CFG["hop_BR"]) < 1 or int(CFG["hop_BR"]) > int(CFG["N_BR"]):
+        raise SystemExit("CFG inválido (BR): verifique N_BR/hop_BR")
     if int(CFG["HR_COL"]) not in (1, 2, 3) or int(CFG["BR_COL"]) not in (1, 2, 3):
         raise SystemExit("CFG inválido: HR_COL/BR_COL devem ser 1,2,3")
 
     st = State()
 
-    # inicia BLE em thread (async separado)
-    t_ble = threading.Thread(target=ble_thread_entry, args=(st,), daemon=True)
+    # CSV (writer thread)
+    csv_q = Queue(maxsize=20000)
+    if CSV_ON:
+        os.makedirs(CSV_DIR, exist_ok=True)
+        fname = f"hr_br_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        csv_path = os.path.join(CSV_DIR, fname)
+        t_csv = threading.Thread(target=csv_writer_thread, args=(st, csv_q, csv_path), daemon=True)
+        t_csv.start()
+        print("CSV:", csv_path)
+
+    # BLE thread
+    t_ble = threading.Thread(target=ble_thread_entry, args=(st, csv_q), daemon=True)
     t_ble.start()
 
     # GUI no main thread
