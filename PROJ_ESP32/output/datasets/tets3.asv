@@ -1,8 +1,8 @@
 clc; clear; close all;
 
 %% ===================== PATHS =====================
-CSV_PATH      = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\Radar_teste.csv';
-POLAR_HR_PATH = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\Polar_teste.txt';
+CSV_PATH      = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\phase.csv';
+POLAR_HR_PATH = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\POLARH2.txt';
 TES_PATH      = 'C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\tes.csv';   % formato: t_sec,HR
 
 %% ===================== CSV COLUNAS =====================
@@ -13,7 +13,7 @@ COL_PHASE = 2;
 gap_thr     = 0.5;     % s
 MIN_SEG_SEC = 2.0;     % s
 
-FS_TARGET = 50.0;      % Hz
+FS_TARGET = 25.0;      % Hz
 IMETH     = 'linear';
 
 WRAP_ON   = 0;         % 1: wrap+mean | 0: mean apenas

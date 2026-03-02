@@ -31,8 +31,8 @@ CFG = dict(
     BR_COL=2,
 
     # tracker (N/hop separados)
-    N=512,        # HR
-    hop=64,       # HR
+    N=256,        # HR
+    hop=32,       # HR
     N_BR=512,     # BR
     hop_BR=64,    # BR
 
@@ -107,7 +107,7 @@ def _pick_signal_by_col(total: float, breath: float, heart: float, col_idx: int)
     return float(heart)
 
 def _col_name(i: int) -> str:
-    return {1: "total", 2: "breath", 3: "heart"}.get(int(i), f"col{i}")
+    return {1: "total", 2: "resp", 3: "heart"}.get(int(i), f"col{i}")
 
 
 # ===================== DSP (realtime-friendly) =====================
@@ -242,7 +242,8 @@ def csv_writer_thread(st, q: Queue, out_path: str):
 
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f, delimiter=",")
-        w.writerow(["t", "BR", "HR"])  # 3 colunas
+        # timestamp,total,resp,heart,BR,HR
+        w.writerow(["timestamp", "total", "resp", "heart", "BR", "HR"])
 
         while (not st.stop_event.is_set()) or (not q.empty()):
             try:
@@ -273,18 +274,22 @@ class State:
         self.ts_back = 0
 
         # plot buffers
-        self.t_raw   = deque(maxlen=30000)
-        self.heart_r = deque(maxlen=30000)
-        self.breath_r= deque(maxlen=30000)
+        self.t_raw    = deque(maxlen=30000)
+        self.heart_r  = deque(maxlen=30000)
+        self.breath_r = deque(maxlen=30000)
 
-        self.heart_f = deque(maxlen=30000)
-        self.breath_f= deque(maxlen=30000)
+        self.heart_f  = deque(maxlen=30000)
+        self.breath_f = deque(maxlen=30000)
 
         self.t_hr = deque(maxlen=MAXP)
         self.hr   = deque(maxlen=MAXP)
 
         self.t_br = deque(maxlen=MAXP)
         self.br   = deque(maxlen=MAXP)
+
+        # últimas estimativas (para logar em toda linha do CSV)
+        self.last_hr = float("nan")
+        self.last_br = float("nan")
 
         self._init_dsp_objects()
 
@@ -313,7 +318,6 @@ class State:
 
         fmin = CFG["F_MIN_HZ"]
 
-        # HR tracker (N/hop)
         self.trk_hr = RealtimeTracker(
             fs=fs, N=CFG["N"], hop=CFG["hop"], f_min_hz=fmin,
             prior_init_per_min=CFG["HR_PRIOR_INIT_BPM"],
@@ -324,7 +328,6 @@ class State:
             ema_tau_sec=CFG["HR_EMA_TAU_SEC"],
         )
 
-        # BR tracker (N_BR/hop_BR)
         self.trk_br = RealtimeTracker(
             fs=fs, N=CFG["N_BR"], hop=CFG["hop_BR"], f_min_hz=fmin,
             prior_init_per_min=CFG["BR_PRIOR_INIT_BRPM"],
@@ -340,6 +343,9 @@ class State:
         self.zi_br = self.zi_br0 * float(x_br_init)
         self.trk_hr.reset()
         self.trk_br.reset()
+        # mantém last_hr/last_br (você pode zerar aqui se quiser)
+        # self.last_hr = float("nan")
+        # self.last_br = float("nan")
 
 
 # ===================== GUI =====================
@@ -365,7 +371,7 @@ def make_gui():
     ax3.set_ylabel("signals")
     ax3.set_xlabel("t (s)")
     ax3.grid(True)
-    ax3.legend(["heart_raw", "breath_raw", "heart_filt", "breath_filt"], loc="upper right")
+    ax3.legend(["heart_raw", "resp_raw", "heart_filt", "resp_filt"], loc="upper right")
 
     fig.tight_layout()
     return fig, (ax1, ax2, ax3), (l_hr, p_hr, l_br, p_br, l_h_r, l_b_r, l_h_f, l_b_f)
@@ -449,7 +455,7 @@ async def ble_async_main(st: State, csv_q: Queue):
                 st.bad += 1
             return
 
-        t_ms, total, breath, heart = rec
+        t_ms, total, resp, heart = rec
 
         with st.lock:
             if st.t0_ms is None:
@@ -468,8 +474,8 @@ async def ble_async_main(st: State, csv_q: Queue):
                 gap = True
             st.last_t_sec = t_sec
 
-        x_hr_raw = _pick_signal_by_col(total, breath, heart, int(CFG["HR_COL"]))
-        x_br_raw = _pick_signal_by_col(total, breath, heart, int(CFG["BR_COL"]))
+        x_hr_raw = _pick_signal_by_col(total, resp, heart, int(CFG["HR_COL"]))
+        x_br_raw = _pick_signal_by_col(total, resp, heart, int(CFG["BR_COL"]))
 
         if gap:
             with st.lock:
@@ -484,6 +490,7 @@ async def ble_async_main(st: State, csv_q: Queue):
             hr_est = st.trk_hr.push(t_sec, y_hr)
             br_est = st.trk_br.push(t_sec, y_br)
 
+            # buffers de plot
             st.t_raw.append(t_sec)
             st.heart_r.append(float(x_hr_raw))
             st.breath_r.append(float(x_br_raw))
@@ -493,26 +500,32 @@ async def ble_async_main(st: State, csv_q: Queue):
             if hr_est is not None:
                 st.t_hr.append(st.trk_hr.t_out[-1])
                 st.hr.append(st.trk_hr.y_out[-1])
-                if CSV_ON:
-                    # linha: t, BR, HR (sem interpolar -> BR NaN)
-                    csv_q.put((float(st.trk_hr.t_out[-1]), float("nan"), float(st.trk_hr.y_out[-1])))
+                st.last_hr = float(st.trk_hr.y_out[-1])
 
             if br_est is not None:
                 st.t_br.append(st.trk_br.t_out[-1])
                 st.br.append(st.trk_br.y_out[-1])
-                if CSV_ON:
-                    # linha: t, BR, HR (sem interpolar -> HR NaN)
-                    csv_q.put((float(st.trk_br.t_out[-1]), float(st.trk_br.y_out[-1]), float("nan")))
+                st.last_br = float(st.trk_br.y_out[-1])
+
+            # >>> CSV: 1 linha por pacote BLE <<<
+            if CSV_ON:
+                csv_q.put((
+                    float(t_ms),           # timestamp (ms) como no pacote
+                    float(total),
+                    float(resp),
+                    float(heart),
+                    float(st.last_br),     # última BR conhecida (NaN se ainda não existe)
+                    float(st.last_hr),     # última HR conhecida (NaN se ainda não existe)
+                ))
 
             st.good += 1
             good = st.good
 
         if good % DEBUG_EVERY_N == 0:
-            print(
-                f"[OK] t={t_sec:8.3f}s | "
-                f"HR={(st.hr[-1] if len(st.hr)>0 else np.nan):6.2f} | "
-                f"BR={(st.br[-1] if len(st.br)>0 else np.nan):6.2f}"
-            )
+            with st.lock:
+                _hr = st.last_hr
+                _br = st.last_br
+            print(f"[OK] t={t_sec:8.3f}s | HR={_hr:6.2f} | BR={_br:6.2f}")
 
     print("Conectando em:", target.address, target.name)
     async with BleakClient(target.address) as client:
