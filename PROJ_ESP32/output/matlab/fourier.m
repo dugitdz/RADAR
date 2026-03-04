@@ -11,7 +11,7 @@ DATASETS = [
 
 %% ===================== FIXOS =====================
 GAP_THR_SEC = 0.6;      % segmentação por buracos (s)
-FS_TARGET   = 25.0;     % Hz (resample uniforme)
+FS_TARGET   = 50.0;     % Hz (resample uniforme)
 
 COL_T_MS  = 1;          % ms
 COL_HEART = 2;          % coluna do sinal (fase/heart)
@@ -24,23 +24,23 @@ MIN_POINTS_AFTER_RESAMPLE = 32;
 MIN_METRIC_SAMPLES        = 10;
 
 %% ===================== CONFIG (FFT) =====================
-CFG.N    = 128;
+CFG.N    = 256;
 CFG.hop  = 32;
 CFG.WRAP = 0;
 
 CFG.win   = "flattop";   % FIXO
 CFG.ftype = "cheby2";    % FIXO
 CFG.ford  = 4;           % ordem final (par) -> cheby2 usa n=ford/2
-CFG.wi    = 0.60;        % Hz
-CFG.wf    = 3.0;        % Hz
+CFG.wi    = 0.595;        % Hz
+CFG.wf    = 3.05;        % Hz
 
-CFG.harm_on    = 1;
+CFG.harm_on    = 0;
 CFG.harm_max   = 3;
 CFG.harm_tol   = 1;
 CFG.harm_ratio = 0.30;
 
 %% ===================== GATING (BP_THEN_GATE) =====================
-GATE_ON     = 1;
+GATE_ON     = 0;
 
 HR_MIN_BPM  = 55;
 HR_MAX_BPM  = 210;
@@ -91,7 +91,8 @@ Rs = 30; % stopband ripple (dB)
 figure('Name','Filtro BP (cheby2) - magnitude/fase','Color','w');
 subplot(2,1,1);
 plot(Wf, 20*log10(abs(Hf)+eps), 'LineWidth',1.2); grid on;
-xlim([0 FS_TARGET/2]);
+xlim([0 5]);
+ylim([-30 0])
 xlabel('Hz'); ylabel('|H| (dB)');
 title(sprintf('Cheby2 BP | ord_final=%d (n=%d) | [%.2f %.2f] Hz | Fs=%.1f', CFG.ford, Ncheb, CFG.wi, CFG.wf, FS_TARGET));
 subplot(2,1,2);

@@ -3,38 +3,48 @@ clc; clear; close all;
 BASE = "C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\";
 
 DATASETS = [
-    struct("name","H2",  "radar", BASE + "phases.csv",     "polar", BASE + "POLARH2.txt")
-    struct("name","H3",  "radar", BASE + "phases_raw.csv", "polar", BASE + "POLARH3.txt")
-    struct("name","H10", "radar", BASE + "phase.csv",      "polar", BASE + "POLARH10.txt")
+    struct("name","H2",    "radar", BASE + "phases.csv",        "polar", BASE + "POLARH2.txt")
+    struct("name","H3",    "radar", BASE + "phases_raw.csv",    "polar", BASE + "POLARH3.txt")
+    struct("name","H10",   "radar", BASE + "phase.csv",         "polar", BASE + "POLARH10.txt")
+    struct("name","TESTE", "radar", BASE + "Radar_teste.csv",   "polar", BASE + "Polar_teste.txt")
 ];
 
 COL_T_MS  = 1;
 COL_PHASE = 2;
 
 gap_thr   = 0.5;
-FS_TARGET = 20.0;
+FS_TARGET = 25.0;
 IMETH     = 'linear';
 WRAP_ON   = 0;
 
 DWT_WAVE  = 'db5';
 DWT_LEVEL = 4;
 
-HR_LEAF   = "D3";        % "D3" (paper) ou "D2D3" (teste)
+% ======= CONFIG ESCOLHIDA (a sua linha) =======
+winN = 64;
+hopN = 16;
+WIN_SEC = winN/FS_TARGET;
+HOP_SEC = hopN/FS_TARGET;
 
-WIN_SEC   = 128/FS_TARGET;
-HOP_SEC   = 32/FS_TARGET;
-USE_WELCH = 1;
+FMIN_HZ = 0.9;
+FMAX_HZ = 2.0;
 
-FMIN_HZ   = 0.8;
-FMAX_HZ   = 2.0;
+CONF_MODE = "pmax_norm";   % conf = pmax/sum(Pb)
+CONF_THR  = 0.006;
 
-CONF_MODE = "pmax_norm"; % "pmax_norm" ou "peak_over_median"
-CONF_THR  = 0.01;
+KEEPD = [4 3];             % "[4 3]"
 
+NFFT_BIG = 4096;
 FINAL_MOVMEAN_SEC = 7;
 
+% ===== plots =====
 SPEC_BPM_MAX = 300;
 SPEC_SMOOTH_BINS = 1;
+
+CONF_DEBUG = 1;
+
+FILL_GAPS_FOR_PLOT = 1;
+MAX_GAP_SEC_PLOT   = 4.0;
 
 fig = figure('Color','w','Name','HR vs Polar + Espectro');
 tg  = uitabgroup(fig);
@@ -85,6 +95,10 @@ for d = 1:nD
     best_sum  = [];
     best_tsum = [];
 
+    conf_all = [];
+    conf_ok  = 0;
+    conf_tot = 0;
+
     for s = 1:size(segments,1)
         i0 = segments(s,1); i1 = segments(s,2);
         ts = t0(i0:i1);
@@ -104,32 +118,25 @@ for d = 1:nD
         tnew = tnew(ok);
         xnew = xnew(ok);
 
-        if numel(tnew) < 32
+        if numel(tnew) < winN
             continue;
         end
 
         xnew = force_finite_vector(xnew);
 
+        % phase difference
         xdiff = [0; diff(xnew)];
         xdiff = force_finite_vector(xdiff);
         xdiff = xdiff - mean(xdiff,'omitnan');
 
+        % DWT
         [C,L] = wavedec(xdiff, DWT_LEVEL, DWT_WAVE);
 
-        D = cell(DWT_LEVEL,1);
-        for lev = 1:DWT_LEVEL
-            D{lev} = force_finite_vector(wrcoef('d', C, L, DWT_WAVE, lev));
-        end
-        A4 = force_finite_vector(wrcoef('a', C, L, DWT_WAVE, DWT_LEVEL));
+        % IDWT correta por seleção de detalhes (KEEPD)
+        x_rec = idwt_keep_details(C, L, DWT_WAVE, DWT_LEVEL, KEEPD);
 
-        if HR_LEAF == "D2D3"
-            x_leaf = force_finite_vector(D{4} + D{3});
-        else
-            x_leaf = force_finite_vector(D{3});
-        end
-
-        x_hr = x_leaf;
-        x_hr = sqrt_energy_match(x_hr, x_leaf);
+        % square-root normalization (energia)
+        x_hr  = sqrt_energy_match(x_rec, xdiff);
 
         seg_len = tnew(end) - tnew(1);
         if seg_len > best_len
@@ -138,7 +145,14 @@ for d = 1:nD
             best_tsum = tnew(:);
         end
 
-        [t_hr, hr_bpm] = estimate_hr_by_psd(tnew, x_hr, FS_TARGET, WIN_SEC, HOP_SEC, USE_WELCH, FMIN_HZ, FMAX_HZ, CONF_MODE, CONF_THR);
+        [t_hr, hr_bpm, conf_vec] = estimate_hr_by_fftpeak(tnew, x_hr, FS_TARGET, winN, hopN, ...
+                                                         FMIN_HZ, FMAX_HZ, CONF_MODE, CONF_THR, NFFT_BIG);
+
+        if ~isempty(conf_vec)
+            conf_all = [conf_all; conf_vec(:)];
+            conf_tot = conf_tot + numel(conf_vec);
+            conf_ok  = conf_ok  + nnz(isfinite(hr_bpm));
+        end
 
         if isempty(t_hr)
             continue;
@@ -146,11 +160,25 @@ for d = 1:nD
 
         if FINAL_MOVMEAN_SEC > 0
             W = max(1, round(FINAL_MOVMEAN_SEC / HOP_SEC));
-            hr_bpm = movmean(hr_bpm, W, 'Endpoints','shrink');
+            hr_bpm = movmean(hr_bpm, W, 'omitnan', 'Endpoints','shrink');
         end
 
         tseg_list{end+1}  = t_hr(:);
         hrseg_list{end+1} = hr_bpm(:);
+    end
+
+    if CONF_DEBUG == 1
+        if isempty(conf_all)
+            fprintf('%s | CONF: sem janelas válidas.\n', ds.name);
+        else
+            c = conf_all(isfinite(conf_all));
+            if isempty(c)
+                fprintf('%s | CONF: tudo NaN.\n', ds.name);
+            else
+                fprintf('%s | CONF(pmax/sum): min=%.4g med=%.4g mean=%.4g max=%.4g | ok=%d/%d (thr=%.4g)\n', ...
+                    ds.name, min(c), median(c), mean(c), max(c), conf_ok, conf_tot, CONF_THR);
+            end
+        end
     end
 
     [tR, hR] = concat_segments(tseg_list, hrseg_list);
@@ -159,8 +187,17 @@ for d = 1:nD
         continue;
     end
 
-    hR_onP = interp1(tR, hR, tP, 'linear', NaN);
+    % interp robusto (remove NaNs)
+    m = isfinite(tR) & isfinite(hR);
+    hR_onP = interp1(tR(m), hR(m), tP, 'linear', NaN);
 
+    % apenas para plot (preenche buracos pequenos)
+    hR_onP_plot = hR_onP;
+    if FILL_GAPS_FOR_PLOT == 1
+        hR_onP_plot = fill_gaps_limited(tP, hR_onP, MAX_GAP_SEC_PLOT);
+    end
+
+    % métricas com série crua (sem preencher)
     mE = isfinite(hR_onP) & isfinite(hP);
     nValid = nnz(mE);
 
@@ -179,95 +216,31 @@ for d = 1:nD
     tl = tiledlayout(tab, 2, 1, 'Padding','compact', 'TileSpacing','compact');
 
     ax1 = nexttile(tl,1); hold(ax1,'on'); grid(ax1,'on');
-    plot(ax1, tP, hP,     'c--', 'LineWidth', 1.6);
-    plot(ax1, tP, hR_onP, 'k-',  'LineWidth', 1.4);
+    plot(ax1, tP, hP,          'c--', 'LineWidth', 1.6);
+    plot(ax1, tP, hR_onP_plot, 'k-',  'LineWidth', 1.4);
     xlabel(ax1,'t (s)'); ylabel(ax1,'HR (bpm)');
-    title(ax1, sprintf('%s | %s | Fs=%.1fHz | WIN=%.1fs HOP=%.1fs | THR=%.3f | RMSE=%.3f MAE=%.3f Corr=%.3f | N=%d', ...
-        ds.name, HR_LEAF, FS_TARGET, WIN_SEC, HOP_SEC, CONF_THR, RMSE, MAE, CORR, nValid));
-    legend(ax1,'POLAR','RADAR (interp@POLAR)','Location','best');
+    title(ax1, sprintf('%s | KEEPD=%s | Fs=%.1fHz | win=%d hop=%d | f=[%.1f..%.1f]Hz | thr=%.4g | RMSE=%.3f MAE=%.3f Corr=%.3f | N=%d', ...
+        ds.name, mat2str(KEEPD), FS_TARGET, winN, hopN, FMIN_HZ, FMAX_HZ, CONF_THR, RMSE, MAE, CORR, nValid));
+    legend(ax1,'POLAR','RADAR (interp@POLAR, gap-fill p/ plot)','Location','best');
 
     ax2 = nexttile(tl,2); hold(ax2,'on'); grid(ax2,'on');
     if ~isempty(best_sum)
-        [bpm, Pdb_sum] = spectrum_db(best_sum, FS_TARGET, SPEC_SMOOTH_BINS);
-        plot(ax2, bpm, Pdb_sum, 'LineWidth', 1.3);
+        [bpm, Pn_sum] = spectrum_lin(best_sum, FS_TARGET, SPEC_SMOOTH_BINS);
+        plot(ax2, bpm, Pn_sum, 'LineWidth', 1.3);
         xlim(ax2,[0 SPEC_BPM_MAX]);
-        ylim(ax2,[-70 5]);
+        ylim(ax2,[0 1.05]);
         xlabel(ax2,'BPM');
-        ylabel(ax2,'Potência (dB rel. ao pico)');
-        title(ax2, sprintf('Espectro (FFT) do HR no maior segmento (%.1fs)', best_len));
+        ylabel(ax2,'Potência (rel. ao pico)');
+        title(ax2, sprintf('Espectro (FFT linear) do HR no maior segmento (%.1fs)', best_len));
     else
         text(ax2, 0.1, 0.5, 'Sem segmento válido para espectro.', 'Units','normalized');
         axis(ax2,'off');
     end
-
-    t_all = t0(:);
-    x_all = x0(:);
-    [t_all, iu] = unique(t_all, 'stable');
-    x_all = x_all(iu);
-
-    tnew_all = (t_all(1):dt:t_all(end))';
-    xnew_all = interp1(t_all, x_all, tnew_all, IMETH);
-
-    ok = isfinite(tnew_all) & isfinite(xnew_all);
-    tnew_all = tnew_all(ok);
-    xnew_all = xnew_all(ok);
-    xnew_all = force_finite_vector(xnew_all);
-
-    xdiff_all = [0; diff(xnew_all)];
-    xdiff_all = force_finite_vector(xdiff_all);
-    xdiff_all = xdiff_all - mean(xdiff_all,'omitnan');
-
-    [C_all, L_all] = wavedec(xdiff_all, DWT_LEVEL, DWT_WAVE);
-
-    D_all = cell(DWT_LEVEL,1);
-    for lev = 1:DWT_LEVEL
-        D_all{lev} = force_finite_vector(wrcoef('d', C_all, L_all, DWT_WAVE, lev));
-    end
-    A_all = force_finite_vector(wrcoef('a', C_all, L_all, DWT_WAVE, DWT_LEVEL));
-
-    if HR_LEAF == "D2D3"
-        leaf_all = force_finite_vector(D_all{2} + D_all{3});
-    else
-        leaf_all = force_finite_vector(D_all{3});
-    end
-
-    SUM_all = akf_smooth_adaptive(leaf_all);
-    SUM_all = sqrt_energy_match(SUM_all, leaf_all);
-    SUM_all = force_finite_vector(SUM_all);
-
-    nrows = DWT_LEVEL + 2;
-    fLeaves = figure('Color','w', 'Name', sprintf('%s - FFT das folhas (%s L%d)', ds.name, DWT_WAVE, DWT_LEVEL));
-    tlv = tiledlayout(fLeaves, nrows, 1, 'Padding','compact', 'TileSpacing','compact');
-
-    ax = nexttile(tlv,1); hold(ax,'on'); grid(ax,'on');
-    [bpmA, PdbA] = spectrum_db(A_all, FS_TARGET, SPEC_SMOOTH_BINS);
-    plot(ax, bpmA, PdbA, 'LineWidth', 1.2);
-    xlim(ax,[0 SPEC_BPM_MAX]);
-    ylim(ax,[-70 5]);
-    ylabel(ax, sprintf('FFT A%d', DWT_LEVEL));
-    title(ax, sprintf('%s | FFT (dB rel. pico) | HR=%s', ds.name, HR_LEAF));
-
-    rr = 2;
-    for lev = DWT_LEVEL:-1:1
-        ax = nexttile(tlv,rr); hold(ax,'on'); grid(ax,'on');
-        [bpmD, PdbD] = spectrum_db(D_all{lev}, FS_TARGET, SPEC_SMOOTH_BINS);
-        plot(ax, bpmD, PdbD, 'LineWidth', 1.0);
-        xlim(ax,[0 SPEC_BPM_MAX]);
-        ylim(ax,[-70 5]);
-        ylabel(ax, sprintf('FFT D%d', lev));
-        rr = rr + 1;
-    end
-
-    ax = nexttile(tlv,nrows); hold(ax,'on'); grid(ax,'on');
-    [bpmS, PdbS] = spectrum_db(SUM_all, FS_TARGET, SPEC_SMOOTH_BINS);
-    plot(ax, bpmS, PdbS, 'LineWidth', 1.3);
-    xlim(ax,[0 SPEC_BPM_MAX]);
-    ylim(ax,[-70 5]);
-    ylabel(ax,'FFT HR (suavizado)');
-    xlabel(ax,'BPM');
 end
 
 fprintf('==============================================================\n\n');
+
+% ===================== FUNCTIONS =====================
 
 function segments = segment_by_gaps(t, gap_thr)
     t = t(:);
@@ -288,16 +261,28 @@ function [t_all, h_all] = concat_segments(tseg_list, hseg_list)
     t_all = [];
     h_all = [];
     for k = 1:numel(tseg_list)
-        tS = tseg_list{k};
-        hS = hseg_list{k};
+        tS = tseg_list{k}(:);
+        hS = hseg_list{k}(:);
+
+        m = isfinite(tS) & isfinite(hS);
+        tS = tS(m);
+        hS = hS(m);
+
         if numel(tS) < 2
             continue;
         end
+
         [tS, iu] = unique(tS, 'stable');
         hS = hS(iu);
+
         t_all = [t_all; tS];
         h_all = [h_all; hS];
     end
+
+    if isempty(t_all)
+        return;
+    end
+
     [t_all, iu] = unique(t_all, 'stable');
     h_all = h_all(iu);
 end
@@ -330,47 +315,71 @@ function x = force_finite_vector(x)
     end
 end
 
-function [t_ctr, hr_bpm] = estimate_hr_by_psd(t, x, Fs, win_sec, hop_sec, useWelch, fmin_hz, fmax_hz, conf_mode, conf_thr)
+function x_rec = idwt_keep_details(C, L, wname, Nlevel, keepD)
+    keepD = unique(keepD(:))';
+    keepD = keepD(keepD>=1 & keepD<=Nlevel);
+
+    Cnew = zeros(size(C));
+    idx = 1;
+
+    lenA = L(1);   % A_N
+    idx = idx + lenA;
+
+    % D_N ... D_1
+    for j = 1:Nlevel
+        lev = Nlevel - j + 1;
+        lenD = L(j+1);
+        i1 = idx;
+        i2 = idx + lenD - 1;
+
+        if any(keepD == lev)
+            Cnew(i1:i2) = C(i1:i2);
+        end
+
+        idx = i2 + 1;
+    end
+
+    x_rec = waverec(Cnew, L, wname);
+    x_rec = x_rec(:);
+    x_rec = x_rec - mean(x_rec,'omitnan');
+    x_rec = fillmissing(x_rec,'linear','EndValues','nearest');
+    x_rec(~isfinite(x_rec)) = 0;
+end
+
+function [t_ctr, hr_bpm, conf_vec] = estimate_hr_by_fftpeak(t, x, Fs, winN, hopN, fmin_hz, fmax_hz, conf_mode, conf_thr, nfft_big)
     t = t(:); x = double(x(:));
     x = x - mean(x,'omitnan');
     x = fillmissing(x,'linear','EndValues','nearest');
     x(~isfinite(x)) = 0;
 
     N = numel(x);
-    winN = max(16, round(win_sec * Fs));
-    hopN = max(1,  round(hop_sec * Fs));
-
     if N < winN
         t_ctr = [];
         hr_bpm = [];
+        conf_vec = [];
         return;
     end
 
     idx0 = 1:hopN:(N-winN+1);
     nt = numel(idx0);
 
-    t_ctr  = zeros(nt,1);
-    hr_bpm = nan(nt,1);
+    t_ctr   = zeros(nt,1);
+    hr_bpm  = nan(nt,1);
+    conf_vec = nan(nt,1);
 
     for i = 1:nt
         i1 = idx0(i);
         seg = x(i1:i1+winN-1);
         seg = seg - mean(seg,'omitnan');
 
-        if useWelch == 1
-            nfft  = max(256, 2^nextpow2(winN));
-            nover = round(0.5*winN);
-            [P,f] = pwelch(seg, hamming(winN,'periodic'), nover, nfft, Fs);
-            P = P(:); f = f(:);
-        else
-            nfft = 2^nextpow2(winN);
-            X = fft(seg, nfft);
-            P = abs(X).^2;
-            f = (0:nfft-1)'*(Fs/nfft);
-            nh = floor(nfft/2)+1;
-            P = P(1:nh);
-            f = f(1:nh);
-        end
+        nfft = max(nfft_big, 2^nextpow2(winN));
+        X = fft(seg, nfft);
+        P = abs(X).^2;
+
+        f = (0:nfft-1)'*(Fs/nfft);
+        nh = floor(nfft/2)+1;
+        P = P(1:nh);
+        f = f(1:nh);
 
         m = (f >= fmin_hz) & (f <= min(fmax_hz, Fs/2));
         t_ctr(i) = t(i1 + floor(winN/2));
@@ -380,38 +389,27 @@ function [t_ctr, hr_bpm] = estimate_hr_by_psd(t, x, Fs, win_sec, hop_sec, useWel
         end
 
         Pb = P(m);
-        fb = f(m);
-
         if ~any(isfinite(Pb)) || max(Pb) <= 0
             continue;
         end
 
         [pmax, kmax] = max(Pb);
-
-        ok = false;
+        fb = f(m);
 
         if conf_mode == "pmax_norm"
-            denom = sum(Pb) + eps;
-            conf = pmax / denom;
-            ok = (conf >= conf_thr);
-
-        elseif conf_mode == "peak_over_median"
-            med = median(Pb(Pb>0));
-            if ~isfinite(med) || med <= 0, med = eps; end
-            conf = pmax / med;
-            ok = (conf >= conf_thr);
-
+            conf = pmax / (sum(Pb) + eps);
         else
-            ok = true;
+            conf = 1;
         end
+        conf_vec(i) = conf;
 
-        if ok
+        if conf >= conf_thr
             hr_bpm(i) = 60*fb(kmax);
         end
     end
 end
 
-function [bpm, Pdb] = spectrum_db(x, Fs, smooth_bins)
+function [bpm, Pn] = spectrum_lin(x, Fs, smooth_bins)
     x = double(x(:));
     x = x - mean(x,'omitnan');
     x = fillmissing(x,'linear','EndValues','nearest');
@@ -430,62 +428,11 @@ function [bpm, Pdb] = spectrum_db(x, Fs, smooth_bins)
     bpm = 60*f;
 
     Pref = max(P) + eps;
-    Pdb = 10*log10(P/Pref + eps);
+    Pn = P / Pref;
 
     if smooth_bins > 1
-        Pdb = movmean(Pdb, smooth_bins, 'omitnan');
+        Pn = movmean(Pn, smooth_bins, 'omitnan');
     end
-end
-
-function y = akf_smooth_adaptive(x)
-    x = double(x(:));
-    x = x - mean(x,'omitnan');
-    x = fillmissing(x,'linear','EndValues','nearest');
-    x(~isfinite(x)) = 0;
-
-    N = numel(x);
-    if N < 3
-        y = x;
-        return;
-    end
-
-    A = 1; H = 1;
-
-    q = var(diff(x), 'omitnan');
-    if ~isfinite(q) || q <= 0
-        q = 1e-6;
-    end
-    Q = q;
-
-    winR = min(40, max(10, floor(N/10)));
-
-    xhat = 0;
-    P = 1;
-
-    y = zeros(N,1);
-
-    for k = 1:N
-        z = x(k);
-
-        xhatp = A * xhat;
-        Pp    = A * P * A + Q;
-
-        i0 = max(1, k-winR+1);
-        rr = var(x(i0:k) - mean(x(i0:k),'omitnan'), 'omitnan');
-        if ~isfinite(rr) || rr <= 0
-            rr = 1e-4;
-        end
-        R = rr;
-
-        K  = Pp * H / (H * Pp * H + R);
-
-        xhat = xhatp + K * (z - H * xhatp);
-        P    = (1 - K * H) * Pp;
-
-        y(k) = xhat;
-    end
-
-    y = y - mean(y,'omitnan');
 end
 
 function y = sqrt_energy_match(x_rec, x_ref)
@@ -551,4 +498,36 @@ function [t_sec, HR] = read_txt_polar_flex(p)
 
     [t_sec, iu] = unique(t_sec,'stable');
     HR = HR(iu);
+end
+
+function yplot = fill_gaps_limited(t, y, max_gap_sec)
+    t = t(:); y = y(:);
+    yplot = y;
+
+    if numel(t) < 3
+        return;
+    end
+
+    isn = ~isfinite(yplot);
+    if ~any(isn)
+        return;
+    end
+
+    d = diff([0; isn; 0]);
+    iStart = find(d== 1);
+    iEnd   = find(d==-1) - 1;
+
+    for k = 1:numel(iStart)
+        a = iStart(k);
+        b = iEnd(k);
+
+        if a == 1 || b == numel(yplot)
+            continue;
+        end
+
+        gap_sec = t(b) - t(a);
+        if gap_sec <= max_gap_sec
+            yplot(a:b) = interp1([t(a-1); t(b+1)], [yplot(a-1); yplot(b+1)], t(a:b), 'linear');
+        end
+    end
 end
