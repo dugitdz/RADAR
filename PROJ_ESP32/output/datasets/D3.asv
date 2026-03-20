@@ -1,9 +1,9 @@
 clc; clear; close all;
 
-BASE = "C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\";
+BASE = "C:\Users\eduar\UTFPR\IC\RADAR\PROJ_ESP32\output\";
 
 DATASETS = [
-    struct("name","H2",    "radar", BASE + "radar_proto.csv",   "polar", BASE + "polar_proto.txt")
+    struct("name","H2",    "radar", BASE + "phases.csv",        "polar", BASE + "POLARH2.txt")
     struct("name","H3",    "radar", BASE + "phases_raw.csv",    "polar", BASE + "POLARH3.txt")
     struct("name","H10",   "radar", BASE + "phase.csv",         "polar", BASE + "POLARH10.txt")
     struct("name","TESTE", "radar", BASE + "Radar_teste.csv",   "polar", BASE + "Polar_teste.txt")
