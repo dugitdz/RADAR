@@ -1,0 +1,634 @@
+clearvars; close all; clc;
+
+% HEALTH RADAR v7
+% Score = -(0.7*RMSE_aligned + 0.3*MAE_aligned)
+% xcorr serve APENAS para alinhar antes de medir erro
+% Confianca: pico/soma, pico/mediana, pico/2o_pico, consistencia temporal
+
+BASE = "C:\Users\eduar\UTFPR\IC\PROJ_ESP32\output\";
+DATASETS = [
+    struct("name","H2",    "radar", BASE+"radar7.csv",  "polar", BASE+"polar7.txt")
+    struct("name","H3",    "radar", BASE+"radar8.csv",  "polar", BASE+"polar8.txt")
+    struct("name","H10",   "radar", BASE+"radar9.csv",  "polar", BASE+"polar9.txt")
+    struct("name","TESTE", "radar", BASE+"radar10.csv", "polar", BASE+"polar10.txt")
+];
+
+COL_T_MS=1; COL_PHASE=2; FS_NATIVE=50.0;
+MIN_N_VALID=50; MIN_COVERAGE=0.30; MIN_N_CORR=20; MIN_N_XCORR=30;
+MAX_LAG_SEC=10.0;
+
+% ===================== GRID SEARCH =======================================
+RUN_GRID = true;
+
+if RUN_GRID
+    fprintf('\n============ GRID SEARCH (parfor) ============\n');
+
+    nDS = numel(DATASETS);
+    pre_tP=cell(nDS,1); pre_hP=cell(nDS,1); pre_rp=cell(nDS,1);
+    for d=1:nDS
+        pre_rp{d}=resolve_any_path(DATASETS(d).radar);
+        pp=resolve_any_path(DATASETS(d).polar);
+        [pre_tP{d},pre_hP{d}]=read_txt_polar_flex(pp);
+    end
+
+    grid_Fs       = [25.0, 50/3, 10.0];
+    grid_winN     = [32, 64, 128, 256];
+    grid_hop_div  = [2, 4];
+    grid_movmean  = [3, 7, 10,1 ];
+    grid_conf_thr = [0.05, 0.10, 0.15, 0.20, 0.30];
+    grid_jump_bpm = [8, 12, 18, 25];
+
+    combos = {};
+    for ifs=1:numel(grid_Fs)
+        Fs=grid_Fs(ifs);
+        max_lev=min(floor(log2(Fs/0.4)),6);
+        for lev=3:max_lev
+            bands=zeros(lev,2);
+            for k=1:lev, bands(k,:)=[Fs/2^(k+1),Fs/2^k]; end
+            card_det=[];
+            for k=1:lev
+                if bands(k,2)>=0.8 && bands(k,1)<=2.5, card_det=[card_det,k]; end
+            end
+            if isempty(card_det), continue; end
+            keepd_cands=gen_keepd_restricted(card_det);
+            for ikd=1:numel(keepd_cands)
+                kd=keepd_cands{ikd};
+                fmin_s=max(0.85,min(bands(kd,1))+0.03);
+                fmax_s=min(Fs/2-0.1,max(bands(kd,2))-0.03);
+                fmax_s=min(fmax_s,2.5);
+                if fmin_s>=fmax_s, continue; end
+                for iwn=1:numel(grid_winN)
+                    wN=grid_winN(iwn);
+                    if wN<2^lev*3, continue; end
+                    nfft=max(512,2^nextpow2(wN));
+                    for ihd=1:numel(grid_hop_div)
+                        hN=max(4,floor(wN/grid_hop_div(ihd)));
+                        for imm=1:numel(grid_movmean)
+                            for ict=1:numel(grid_conf_thr)
+                                for ijp=1:numel(grid_jump_bpm)
+                                    c=struct('Fs',Fs,'level',lev,'keepd',kd,...
+                                        'winN',wN,'hopN',hN,'nfft',nfft,...
+                                        'movmean_s',grid_movmean(imm),...
+                                        'conf_thr',grid_conf_thr(ict),...
+                                        'jump_bpm',grid_jump_bpm(ijp),...
+                                        'fmin',fmin_s,'fmax',fmax_s);
+                                    combos{end+1}=c;
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    nCombos=numel(combos);
+    fprintf('Combinacoes a testar: %d\n',nCombos);
+
+    par_rmses_al=nan(nCombos,1);
+    par_maes_al =nan(nCombos,1);
+    par_corrs_al=nan(nCombos,1);
+    par_lags    =nan(nCombos,1);
+    par_nds     =zeros(nCombos,1);
+
+    parfor ci=1:nCombos
+        c=combos{ci};
+        ds_rmse=nan(nDS,1); ds_mae=nan(nDS,1);
+        ds_corr=nan(nDS,1); ds_lag=nan(nDS,1);
+        ds_ok=0;
+        for d=1:nDS
+            tP=pre_tP{d}; hP=pre_hP{d}; rp=pre_rp{d};
+            if isempty(tP), continue; end
+            [hNC,ok]=algo_noncausal_dwt(rp,tP,COL_T_MS,COL_PHASE,...
+                0.5,c.Fs,'linear',0,'db5',c.level,c.keepd,...
+                c.winN,c.hopN,c.fmin,c.fmax,"composite",...
+                c.conf_thr,c.nfft,c.movmean_s,c.jump_bpm);
+            if ~ok, continue; end
+            mk=isfinite(hNC)&isfinite(hP);
+            nv=nnz(mk); cov=nv/numel(tP);
+            if nv<MIN_N_VALID||cov<MIN_COVERAGE, continue; end
+            % Alinhar por xcorr e medir erro no sinal alinhado
+            [rmse_al,mae_al,~,corr_al,~,~,~,lag_sec,~]=metrics_aligned(hNC,hP,tP,MIN_N_XCORR,MAX_LAG_SEC);
+            if isfinite(rmse_al)
+                ds_rmse(d)=rmse_al; ds_mae(d)=mae_al;
+                ds_corr(d)=corr_al; ds_lag(d)=abs(lag_sec);
+                ds_ok=ds_ok+1;
+            end
+        end
+        if ds_ok>=2
+            par_rmses_al(ci)=mean(ds_rmse,'omitnan');
+            par_maes_al(ci) =mean(ds_mae,'omitnan');
+            par_corrs_al(ci)=mean(ds_corr,'omitnan');
+            par_lags(ci)    =mean(ds_lag,'omitnan');
+            par_nds(ci)     =ds_ok;
+        end
+    end
+
+    % Score = -(0.7*RMSE_aligned + 0.3*MAE_aligned)
+    valid_mask=isfinite(par_rmses_al)&par_nds>=2;
+    valid_idx=find(valid_mask);
+    fprintf('Configs validas: %d / %d\n',numel(valid_idx),nCombos);
+
+    if ~isempty(valid_idx)
+        scores=nan(numel(valid_idx),1);
+        for i=1:numel(valid_idx)
+            j=valid_idx(i);
+            scores(i)=-(0.7*par_rmses_al(j)+0.3*par_maes_al(j));
+        end
+        [~,sord]=sort(scores,'descend');
+
+        fprintf('\n--- TOP 20 (score = -(0.7*RMSE_al + 0.3*MAE_al)) ---\n');
+        fprintf('%-6s %-4s %-10s %-5s %-5s %-4s %-5s %-5s %-14s %-8s %-8s %-7s %-7s %-8s\n',...
+            'Fs','Lev','KEEPD','winN','hop','mmS','cThr','jBPM','freq','RMSE_al','MAE_al','CORR_al','|lag|s','SCORE');
+        for i=1:min(20,numel(sord))
+            j=valid_idx(sord(i));
+            c=combos{j};
+            fprintf('%-6.2f %-4d %-10s %-5d %-5d %-4d %-5.2f %-5d [%.2f-%.2f] %-8.3f %-8.3f %-7.3f %-7.2f %-8.3f\n',...
+                c.Fs,c.level,sprintf('[%s]',num2str(c.keepd)),c.winN,...
+                c.hopN,c.movmean_s,c.conf_thr,c.jump_bpm,...
+                c.fmin,c.fmax,...
+                par_rmses_al(j),par_maes_al(j),par_corrs_al(j),...
+                par_lags(j),scores(sord(i)));
+        end
+
+        best_j=valid_idx(sord(1));
+        best=combos{best_j};
+        fprintf('\n-> Best: Fs=%.2f Lev=%d KEEPD=[%s] winN=%d hop=%d mm=%ds cThr=%.2f jBPM=%d\n',...
+            best.Fs,best.level,num2str(best.keepd),best.winN,...
+            best.hopN,best.movmean_s,best.conf_thr,best.jump_bpm);
+        fprintf('   RMSE_al=%.3f MAE_al=%.3f CORR_al=%.3f |lag|=%.2fs SCORE=%.3f\n',...
+            par_rmses_al(best_j),par_maes_al(best_j),par_corrs_al(best_j),...
+            par_lags(best_j),scores(sord(1)));
+
+        FS_TARGET=best.Fs; DWT_LEVEL=best.level; KEEPD=best.keepd;
+        winN=best.winN; hopN=best.hopN; FMIN_HZ=best.fmin; FMAX_HZ=best.fmax;
+        NFFT_BIG=best.nfft;
+        FINAL_MOVMEAN_SEC=best.movmean_s; CONF_THR=best.conf_thr;
+        JUMP_BPM=best.jump_bpm;
+    else
+        fprintf('Nenhuma config valida.\n');
+        FS_TARGET=50/3;DWT_LEVEL=4;KEEPD=[3];winN=128;hopN=32;
+        FMIN_HZ=1.05;FMAX_HZ=2.05;NFFT_BIG=512;
+        FINAL_MOVMEAN_SEC=5;CONF_THR=0.10;JUMP_BPM=15;
+    end
+else
+    FS_TARGET=50/3;DWT_LEVEL=4;KEEPD=[3];winN=128;hopN=32;
+    FMIN_HZ=1.05;FMAX_HZ=2.05;NFFT_BIG=512;
+    FINAL_MOVMEAN_SEC=5;CONF_THR=0.10;JUMP_BPM=15;
+end
+
+gap_thr=0.5;IMETH='linear';WRAP_ON=0;DWT_WAVE='db5';
+CONF_MODE="composite";
+FILL_GAPS_FOR_PLOT=1;MAX_GAP_SEC_PLOT=4.0;
+
+fprintf('\n======================================================================\n');
+fprintf('  HEALTH RADAR v7\n');
+fprintf('  Fs=%.4f Hz (50/%d) | DWT %s nivel %d | KEEPD=[%s]\n',...
+    FS_TARGET,round(FS_NATIVE/FS_TARGET),DWT_WAVE,DWT_LEVEL,num2str(KEEPD));
+fprintf('  winN=%d (%.2fs) hop=%d (%.2fs) NFFT=%d\n',...
+    winN,winN/FS_TARGET,hopN,hopN/FS_TARGET,NFFT_BIG);
+fprintf('  HR: [%.2f-%.2f]Hz=[%d-%d]bpm | mm=%ds | cThr=%.2f | jBPM=%d\n',...
+    FMIN_HZ,FMAX_HZ,round(FMIN_HZ*60),round(FMAX_HZ*60),...
+    FINAL_MOVMEAN_SEC,CONF_THR,JUMP_BPM);
+fprintf('  Score: -(0.7*RMSE_al + 0.3*MAE_al) | xcorr so para alinhar\n');
+fprintf('======================================================================\n');
+
+fprintf('\nBandas DWT (Fs=%.4f Hz, %s, %d niveis):\n',FS_TARGET,DWT_WAVE,DWT_LEVEL);
+for lev=1:DWT_LEVEL
+    fl=FS_TARGET/2^(lev+1);fh=FS_TARGET/2^lev;
+    if any(KEEPD==lev),tag=' <-- MANTIDO';else,tag='';end
+    fprintf('  D%d: %.4f-%.4f Hz (%.1f-%.1f bpm)%s\n',lev,fl,fh,fl*60,fh*60,tag);
+end
+fprintf('  A%d: 0-%.4f Hz descartado\n',DWT_LEVEL,FS_TARGET/2^(DWT_LEVEL+1));
+
+fprintf('\n================ RESULTADOS FINAIS ================\n');
+
+fig=figure('Color','w','Position',[50 50 1100 850]);
+tlay=tiledlayout(numel(DATASETS),1,'TileSpacing','tight','Padding','compact');
+ax=gobjects(numel(DATASETS),1);
+hPL=[];hNCL=[];hRTL=[];
+
+for d=1:numel(DATASETS)
+    ds=DATASETS(d);
+    rp=resolve_any_path(ds.radar);rl=get_file_stem(rp);
+    pp=resolve_any_path(ds.polar);
+    [tP,hP]=read_txt_polar_flex(pp);
+    if isempty(tP),fprintf('\n%s | Polar vazio.\n',rl);continue;end
+    nP=numel(tP);
+    A_raw=[];
+    try A_raw=readmatrix(rp);t_dur=(A_raw(end,COL_T_MS)-A_raw(1,COL_T_MS))/1000;
+    catch,t_dur=NaN;end
+    fprintf('\n-> [%s] Radar=%.1fs Polar=%.1fs (N=%d)\n',ds.name,t_dur,tP(end),nP);
+
+    % NC
+    [hNC,okNC]=algo_noncausal_dwt(rp,tP,COL_T_MS,COL_PHASE,...
+        gap_thr,FS_TARGET,IMETH,WRAP_ON,DWT_WAVE,DWT_LEVEL,KEEPD,...
+        winN,hopN,FMIN_HZ,FMAX_HZ,CONF_MODE,CONF_THR,NFFT_BIG,...
+        FINAL_MOVMEAN_SEC,JUMP_BPM);
+    hNC_p=hNC;
+    if okNC&&FILL_GAPS_FOR_PLOT,hNC_p=fill_gaps_limited(tP,hNC,MAX_GAP_SEC_PLOT);end
+    mk=isfinite(hNC)&isfinite(hP);nv=nnz(mk);cov_v=nv/nP;
+    fprintf('%s | NC: N=%d cov=%.1f%%\n',rl,nv,cov_v*100);
+    if nv>=MIN_N_VALID&&cov_v>=MIN_COVERAGE
+        [R1,M1,P1,C1,n1]=metrics_vs_polar(hNC,hP,MIN_N_CORR);
+        fprintf('%s | NC sem alin: RMSE=%.3f MAE=%.3f MAPE=%.2f%% CORR=%.3f N=%d\n',rl,R1,M1,P1,C1,n1);
+        [R2,M2,P2,C2,n2,lg,rmx,lg_s,dt_e]=metrics_aligned(hNC,hP,tP,MIN_N_XCORR,MAX_LAG_SEC);
+        fprintf('%s | xcorr: lag=%d dt=%.4fs lag_s=%.3fs rmax=%.4f\n',rl,lg,dt_e,lg_s,rmx);
+        fprintf('%s | NC com alin: RMSE=%.3f MAE=%.3f MAPE=%.2f%% CORR=%.3f N=%d\n',rl,R2,M2,P2,C2,n2);
+        fprintf('%s | Melhoria: dRMSE=%.3f dMAE=%.3f dCORR=%.4f\n',rl,R1-R2,M1-M2,C2-C1);
+    else
+        fprintf('%s | NC: REJEITADO\n',rl);end
+
+    % RT
+    hRT=nan(size(tP));hRT_p=hRT;
+    if ~isempty(A_raw)&&size(A_raw,2)>=max(COL_T_MS,COL_PHASE)
+        [t_rt,hr_rt]=algo_realtime_dwt_causal(A_raw,COL_T_MS,COL_PHASE,...
+            gap_thr,FS_TARGET,WRAP_ON,DWT_WAVE,DWT_LEVEL,KEEPD,...
+            winN,hopN,FMIN_HZ,FMAX_HZ,CONF_MODE,CONF_THR,NFFT_BIG,...
+            FINAL_MOVMEAN_SEC,JUMP_BPM);
+        if ~isempty(t_rt)&&nnz(isfinite(hr_rt))>=5
+            [tu,iu]=unique(t_rt,'stable');hru=hr_rt(iu);
+            mok=isfinite(tu)&isfinite(hru);
+            if nnz(mok)>=2,hRT=interp1(tu(mok),hru(mok),tP,'linear',NaN);end
+            hRT_p=hRT;
+            if FILL_GAPS_FOR_PLOT,hRT_p=fill_gaps_limited(tP,hRT,MAX_GAP_SEC_PLOT);end
+            mk2=isfinite(hRT)&isfinite(hP);nv2=nnz(mk2);cov2=nv2/nP;
+            fprintf('%s | RT: N=%d cov=%.1f%%\n',rl,nv2,cov2*100);
+            if nv2>=MIN_N_VALID&&cov2>=MIN_COVERAGE
+                [R3,M3,P3,C3,n3]=metrics_vs_polar(hRT,hP,MIN_N_CORR);
+                fprintf('%s | RT sem alin: RMSE=%.3f MAE=%.3f MAPE=%.2f%% CORR=%.3f N=%d\n',rl,R3,M3,P3,C3,n3);
+                [R4,M4,P4,C4,n4,lg2,rmx2,lg_s2,dt_e2]=metrics_aligned(hRT,hP,tP,MIN_N_XCORR,MAX_LAG_SEC);
+                fprintf('%s | RT xcorr: lag=%d dt=%.4fs lag_s=%.3fs rmax=%.4f\n',rl,lg2,dt_e2,lg_s2,rmx2);
+                fprintf('%s | RT com alin: RMSE=%.3f MAE=%.3f MAPE=%.2f%% CORR=%.3f N=%d\n',rl,R4,M4,P4,C4,n4);
+                fprintf('%s | Melhoria RT: dRMSE=%.3f dMAE=%.3f dCORR=%.4f\n',rl,R3-R4,M3-M4,C4-C3);
+            else
+                fprintf('%s | RT: REJEITADO\n',rl);end
+        else
+            fprintf('%s | RT: poucas estimativas.\n',rl);end
+    else
+        fprintf('%s | RT: radar indisponivel.\n',rl);end
+
+    ax(d)=nexttile;hold(ax(d),'on');grid(ax(d),'on');
+    h1=plot(ax(d),tP,hP,'r-','LineWidth',2);
+    h2=plot(ax(d),tP,hNC_p,'k-','LineWidth',1.5);
+    h3=plot(ax(d),tP,hRT_p,'b--','LineWidth',1.5);
+    ylabel(ax(d),'HR (bpm)','FontSize',11,'FontWeight','bold');
+    title(ax(d),ds.name,'FontSize',12,'FontWeight','bold');
+    set(ax(d),'FontSize',10);
+    if d<numel(DATASETS),set(ax(d),'XTickLabel',[]);else
+        xlabel(ax(d),'Tempo (s)','FontSize',11,'FontWeight','bold');end
+    if isempty(hPL),hPL=h1;hNCL=h2;hRTL=h3;end
+end
+linkaxes(ax,'xy');xlim(ax(1),[0 250]);ylim(ax(1),[60 110]);
+lgd=legend([hPL hNCL hRTL],{'POLAR H10','NC (DWT Batch)','RT (DWT Causal)'},...
+    'Orientation','horizontal','FontSize',11,'Box','off');
+lgd.Layout.Tile='north';
+fprintf('\n====== Fim. ======\n');
+
+% =========================================================================
+% FUNCOES
+% =========================================================================
+
+% Confianca composta: 4 fatores
+function conf = composite_confidence(Pb, fb, pmax, kmax, hr_prev, ~, jump_bpm)
+    % F1: pico / soma (classico)
+    f1 = pmax / (sum(Pb)+eps);
+    % F2: pico / mediana (penaliza espectro plano)
+    f2 = min(pmax/(median(Pb)+eps)/10.0, 1.0);
+    % F3: pico / 2o maior pico (rejeita espectro ambiguo)
+    Ps = sort(Pb,'descend');
+    if numel(Ps)>=2 && Ps(2)>0
+        f3 = min((Ps(1)/Ps(2))/3.0, 1.0);  % ratio 3x = score 1.0
+    else
+        f3 = 1.0;
+    end
+    % F4: consistencia temporal
+    f4 = 1.0;
+    if isfinite(hr_prev)
+        hr_cand = 60*fb(kmax);
+        jump = abs(hr_cand-hr_prev);
+        if jump>jump_bpm, f4=max(0.05, 1.0-(jump-jump_bpm)/30.0); end
+    end
+    conf = (f1*f2*f3*f4)^(1/4);
+end
+
+% Metricas com alinhamento por xcorr
+function [RMSE,MAE,MAPE,CORR,nV,lag_opt,rmax,lag_sec,dt_eff] = metrics_aligned(h_est,h_ref,tP,min_n,max_lag_s)
+    lag_opt=0;rmax=NaN;lag_sec=0;dt_eff=NaN;
+    m=isfinite(h_est)&isfinite(h_ref);
+    if nnz(m)<min_n
+        [RMSE,MAE,MAPE,CORR,nV]=metrics_vs_polar(h_est,h_ref,5);return;end
+    [i0,i1]=longest_valid_run(m);
+    if (i1-i0+1)<min_n
+        [RMSE,MAE,MAPE,CORR,nV]=metrics_vs_polar(h_est,h_ref,5);return;end
+    t_run=tP(i0:i1);
+    dt_eff=(t_run(end)-t_run(1))/(numel(t_run)-1);
+    x=h_est(i0:i1)-mean(h_est(i0:i1));
+    y=h_ref(i0:i1)-mean(h_ref(i0:i1));
+    [r,lags]=xcorr(x,y,'coeff');
+    max_lag_samp=round(max_lag_s/dt_eff);
+    r_s=r;r_s(abs(lags)>max_lag_samp)=-Inf;
+    [rmax,ix]=max(r_s);
+    lag_opt=lags(ix);lag_sec=lag_opt*dt_eff;
+    N=numel(h_est);h_al=nan(N,1);
+    if lag_opt>=0
+        if lag_opt<N,h_al(1:N-lag_opt)=h_est(lag_opt+1:N);end
+    else
+        al=abs(lag_opt);
+        if al<N,h_al(al+1:N)=h_est(1:N-al);end
+    end
+    [RMSE,MAE,MAPE,CORR,nV]=metrics_vs_polar(h_al,h_ref,5);
+end
+
+function [i0,i1]=longest_valid_run(m)
+    m=m(:);d=diff([0;m;0]);
+    starts=find(d==1);ends=find(d==-1)-1;
+    lens=ends-starts+1;[~,b]=max(lens);
+    i0=starts(b);i1=ends(b);
+end
+
+function [RMSE,MAE,MAPE,CORR,nV]=metrics_vs_polar(h_est,h_ref,min_n_corr)
+    m=isfinite(h_est)&isfinite(h_ref);nV=nnz(m);
+    if nV<5,RMSE=NaN;MAE=NaN;MAPE=NaN;CORR=NaN;return;end
+    e=h_est(m)-h_ref(m);
+    RMSE=sqrt(mean(e.^2,'omitnan'));
+    MAE=mean(abs(e),'omitnan');
+    MAPE=mean(abs(e./h_ref(m)),'omitnan')*100;
+    if nV>=min_n_corr,CORR=corr(h_est(m),h_ref(m),'Rows','complete');
+    else,CORR=NaN;end
+end
+
+% Non-causal DWT batch
+function [h_onP,okB]=algo_noncausal_dwt(rpath,tP,COL_T,COL_PH,...
+    gap_thr,Fs,IMETH,WRAP,DWT_W,DWT_L,KEEPD,winN,hopN,...
+    FMIN,FMAX,CMODE,CTHR,NFFT,MM_SEC,JUMP_BPM)
+    okB=false;h_onP=nan(size(tP));
+    try A=readmatrix(rpath);catch,return;end
+    if size(A,2)<max(COL_T,COL_PH),return;end
+    tp=A(:,COL_T);ph=A(:,COL_PH);tp=tp(:);ph=ph(:);
+    mk=isfinite(tp)&isfinite(ph)&(abs(ph)<=10);
+    tp=tp(mk);ph=ph(mk);
+    if numel(tp)<8,return;end
+    t0=(tp-tp(1))/1000;
+    [t0,ia]=unique(t0,'stable');ph=ph(ia);
+    ph=force_finite_vector(double(ph));ph=unwrap(ph);
+    if WRAP==1,x0=wrap_phase(ph);else
+        x0=ph-mean(ph,'omitnan');x0=force_finite_vector(x0);end
+    segs=segment_by_gaps(t0,gap_thr);
+    dt=1/Fs;ts_l={};hr_l={};
+    for s=1:size(segs,1)
+        i0=segs(s,1);i1=segs(s,2);
+        ts=t0(i0:i1);xs=x0(i0:i1);
+        [ts,iu]=unique(ts,'stable');xs=xs(iu);
+        if numel(ts)<8,continue;end
+        tn=(ts(1):dt:ts(end))';
+        xn=interp1(ts,xs,tn,IMETH);
+        ok=isfinite(tn)&isfinite(xn);tn=tn(ok);xn=xn(ok);
+        if numel(tn)<winN,continue;end
+        xn=force_finite_vector(xn);
+        xd=[0;diff(xn)];xd=force_finite_vector(xd);xd=xd-mean(xd,'omitnan');
+        [C,L]=wavedec(xd,DWT_L,DWT_W);
+        xr=idwt_keep_details(C,L,DWT_W,DWT_L,KEEPD);
+        [thr,hbpm,~]=est_hr_fft_composite(tn,xr,Fs,winN,hopN,FMIN,FMAX,CMODE,CTHR,NFFT,JUMP_BPM);
+        if isempty(thr),continue;end
+        if MM_SEC>0
+            W=max(1,round(MM_SEC/(hopN/Fs)));
+            hbpm=movmean(hbpm,W,'omitnan','Endpoints','shrink');
+        end
+        ts_l{end+1}=thr(:);hr_l{end+1}=hbpm(:);
+    end
+    [tR,hR]=concat_segments(ts_l,hr_l);
+    if isempty(tR),return;end
+    mk=isfinite(tR)&isfinite(hR);
+    if nnz(mk)<5,return;end
+    h_onP=interp1(tR(mk),hR(mk),tP,'linear',NaN);
+    okB=true;
+end
+
+% Real-time causal DWT
+function [t_out,hr_out]=algo_realtime_dwt_causal(A_raw,COL_T,COL_PH,...
+    gap_thr,Fs,WRAP,DWT_W,DWT_L,KEEPD,winN,hopN,...
+    FMIN,FMAX,CMODE,CTHR,NFFT,MM_SEC,JUMP_BPM)
+    t_out=[];hr_out=[];
+    tp=A_raw(:,COL_T);ph=A_raw(:,COL_PH);
+    mk=isfinite(tp)&isfinite(ph)&(abs(ph)<=10);
+    tp=tp(mk);ph=ph(mk);
+    if numel(tp)<8,return;end
+    t0=(tp-tp(1))/1000;
+    [t0,ia]=unique(t0,'stable');ph=ph(ia);
+    phu=unwrap(force_finite_vector(double(ph)));
+    if WRAP==1,x0=wrap_phase(phu);else,x0=phu-mean(phu);end
+    dt=1/Fs;
+    buf_x=zeros(winN,1);buf_t=zeros(winN,1);
+    buf_n=0;hop_cnt=0;
+    HOP_S=hopN/Fs;W_mm=max(1,round(MM_SEC/HOP_S));
+    hr_hist=nan(W_mm,1);hr_prev=NaN;
+    t_tgt=t0(1);ri=2;
+    while ri<=length(t0)
+        tp_=t0(ri-1);xp=x0(ri-1);
+        tn_=t0(ri);xn=x0(ri);
+        if (tn_-tp_)>gap_thr
+            buf_n=0;hop_cnt=0;hr_hist=nan(W_mm,1);
+            buf_x=zeros(winN,1);buf_t=zeros(winN,1);hr_prev=NaN;
+            t_tgt=tn_;ri=ri+1;continue;
+        end
+        while t_tgt<=tn_
+            if t_tgt>=tp_
+                frac=(t_tgt-tp_)/(tn_-tp_);
+                xi=xp+(xn-xp)*frac;
+                if buf_n<winN
+                    buf_n=buf_n+1;buf_x(buf_n)=xi;buf_t(buf_n)=t_tgt;
+                else
+                    buf_x=[buf_x(2:end);xi];buf_t=[buf_t(2:end);t_tgt];
+                    hop_cnt=hop_cnt+1;
+                end
+                if buf_n==winN&&hop_cnt>=hopN
+                    hop_cnt=0;
+                    xp_=buf_x-mean(buf_x,'omitnan');
+                    xd=[0;diff(xp_)];xd=force_finite_vector(xd);xd=xd-mean(xd,'omitnan');
+                    [C,L]=wavedec(xd,DWT_L,DWT_W);
+                    xhr=idwt_keep_details(C,L,DWT_W,DWT_L,KEEPD);
+                    seg=xhr-mean(xhr,'omitnan');seg=seg.*hann(winN);
+                    nfft=max(NFFT,2^nextpow2(winN));
+                    X=fft(seg,nfft);P=abs(X).^2;
+                    nh=floor(nfft/2)+1;P=P(1:nh);
+                    f=(0:nfft-1)'*(Fs/nfft);f=f(1:nh);
+                    mask=(f>=FMIN)&(f<=min(FMAX,Fs/2));
+                    Pb=P(mask);fb=f(mask);hr_val=NaN;
+                    if numel(Pb)>=5&&max(Pb)>0
+                        [pmax,kmax]=max(Pb);
+                        if CMODE=="composite"
+                            conf=composite_confidence(Pb,fb,pmax,kmax,hr_prev,CTHR,JUMP_BPM);
+                        else,conf=pmax/(sum(Pb)+eps);end
+                        if conf>=CTHR
+                            if kmax>1&&kmax<numel(Pb)
+                                y1=log(max(Pb(kmax-1),eps));y2=log(max(Pb(kmax),eps));
+                                y3=log(max(Pb(kmax+1),eps));den=y1-2*y2+y3;
+                                if abs(den)>eps,delta=0.5*(y1-y3)/den;delta=max(min(delta,1),-1);
+                                else,delta=0;end
+                                fpk=fb(kmax)+delta*(fb(2)-fb(1));
+                            else,fpk=fb(kmax);end
+                            hr_val=60*fpk;hr_prev=hr_val;
+                        end
+                    end
+                    if MM_SEC>0
+                        hr_hist=[hr_hist(2:end);hr_val];hr_final=mean(hr_hist,'omitnan');
+                    else,hr_final=hr_val;end
+                    t_out=[t_out;buf_t(end)];hr_out=[hr_out;hr_final];
+                end
+            end
+            t_tgt=t_tgt+dt;
+        end
+        ri=ri+1;
+    end
+end
+
+% HR por FFT com confianca composta (batch)
+function [t_c,hr,cf]=est_hr_fft_composite(t,x,Fs,winN,hopN,fmin,fmax,cmode,cthr,nfft_big,jump_bpm)
+    t=t(:);x=double(x(:));
+    x=x-mean(x,'omitnan');x=fillmissing(x,'linear','EndValues','nearest');
+    x(~isfinite(x))=0;N=numel(x);
+    if N<winN,t_c=[];hr=[];cf=[];return;end
+    idx0=1:hopN:(N-winN+1);nt=numel(idx0);
+    t_c=zeros(nt,1);hr=nan(nt,1);cf=nan(nt,1);
+    hr_prev=NaN;
+    for i=1:nt
+        i1=idx0(i);seg=x(i1:i1+winN-1);seg=seg-mean(seg,'omitnan');
+        seg=seg.*hann(numel(seg));
+        nfft=max(nfft_big,2^nextpow2(winN));
+        X=fft(seg,nfft);P=abs(X).^2;
+        f=(0:nfft-1)'*(Fs/nfft);nh=floor(nfft/2)+1;P=P(1:nh);f=f(1:nh);
+        mask=(f>=fmin)&(f<=min(fmax,Fs/2));
+        t_c(i)=t(i1+floor(winN/2));
+        if nnz(mask)<5,continue;end
+        Pb=P(mask);fb=f(mask);
+        if ~any(isfinite(Pb))||max(Pb)<=0,continue;end
+        [pmax,kmax]=max(Pb);
+        if cmode=="composite"
+            conf=composite_confidence(Pb,fb,pmax,kmax,hr_prev,cthr,jump_bpm);
+        else,conf=pmax/(sum(Pb)+eps);end
+        cf(i)=conf;
+        if conf>=cthr
+            if kmax>1&&kmax<numel(Pb)
+                y1=log(max(Pb(kmax-1),eps));y2=log(max(Pb(kmax),eps));
+                y3=log(max(Pb(kmax+1),eps));den=y1-2*y2+y3;
+                if abs(den)>eps,delta=0.5*(y1-y3)/den;delta=max(min(delta,1),-1);
+                else,delta=0;end
+                fpk=fb(kmax)+delta*(fb(2)-fb(1));
+            else,fpk=fb(kmax);end
+            hr(i)=60*fpk;hr_prev=hr(i);
+        end
+    end
+end
+
+% DWT reconstrucao parcial
+function xr=idwt_keep_details(C,L,wname,Nlev,keepD)
+    keepD=unique(keepD(:))';keepD=keepD(keepD>=1&keepD<=Nlev);
+    Cn=zeros(size(C));idx=1+L(1);
+    for j=1:Nlev
+        lev=Nlev-j+1;lenD=L(j+1);i1=idx;i2=idx+lenD-1;
+        if any(keepD==lev),Cn(i1:i2)=C(i1:i2);end
+        idx=i2+1;
+    end
+    xr=waverec(Cn,L,wname);xr=xr(:);
+    xr=xr-mean(xr,'omitnan');
+    xr=fillmissing(xr,'linear','EndValues','nearest');
+    xr(~isfinite(xr))=0;
+end
+
+% Utilitarias
+function segs=segment_by_gaps(t,gap)
+    t=t(:);n=numel(t);
+    if n<2,segs=[1 n];return;end
+    brk=find(diff(t)>gap);
+    if isempty(brk),segs=[1 n];else,segs=[[1;brk+1],[brk;n]];end
+end
+
+function [ta,ha]=concat_segments(tl,hl)
+    ta=[];ha=[];
+    for k=1:numel(tl)
+        ts=tl{k}(:);hs=hl{k}(:);
+        m=isfinite(ts)&isfinite(hs);ts=ts(m);hs=hs(m);
+        if numel(ts)<2,continue;end
+        [ts,iu]=unique(ts,'stable');hs=hs(iu);
+        ta=[ta;ts];ha=[ha;hs];
+    end
+    if isempty(ta),return;end
+    [ta,iu]=unique(ta,'stable');ha=ha(iu);
+end
+
+function x=wrap_phase(ph)
+    ph=double(ph(:));ph=force_finite_vector(ph);
+    x=mod(ph+pi,2*pi)-pi;x=x-mean(x,'omitnan');
+end
+
+function x=force_finite_vector(x)
+    x=double(x(:));ok=isfinite(x);
+    if all(ok),return;end
+    if nnz(ok)>=2
+        xi=find(ok);x(~ok)=interp1(xi,x(ok),find(~ok),'linear','extrap');
+    elseif nnz(ok)==1,x(~ok)=x(ok);
+    else,x(:)=0;return;end
+    x(~isfinite(x))=0;
+end
+
+function p2=resolve_any_path(p)
+    p=string(p);
+    if exist(p,'file')==2,p2=char(p);return;end
+    exts=[".csv" ".txt" ".CSV" ".TXT"];
+    for e=exts,if exist(p+e,'file')==2,p2=char(p+e);return;end,end
+    p2=char(p);
+end
+
+function s=get_file_stem(p)
+    [~,s,~]=fileparts(char(p));s=string(s);
+end
+
+function [t_sec,HR]=read_txt_polar_flex(p)
+    fid=fopen(p,'r');
+    if fid==-1,t_sec=[];HR=[];return;end
+    raw=textscan(fid,'%s','Delimiter','\n');raw=raw{1};fclose(fid);
+    if numel(raw)<2,t_sec=[];HR=[];return;end
+    lines=raw(2:end);
+    ts_str=strings(numel(lines),1);HR=nan(numel(lines),1);
+    for i=1:numel(lines)
+        L=string(lines{i});
+        if contains(L,";"),parts=split(L,";");else,parts=split(L,",");end
+        if numel(parts)>=2
+            ts_str(i)=strtrim(parts(1));HR(i)=str2double(strtrim(parts(2)));
+        end
+    end
+    try,t_dt=datetime(ts_str,'InputFormat',"yyyy-MM-dd'T'HH:mm:ss.SSS");
+    catch,t_dt=datetime(ts_str,'InputFormat',"yyyy-MM-dd HH:mm:ss.SSS");end
+    t_sec=seconds(t_dt-t_dt(1));t_sec=t_sec(:);HR=HR(:);
+    m=isfinite(t_sec)&isfinite(HR);t_sec=t_sec(m);HR=HR(m);
+    [t_sec,iu]=unique(t_sec,'stable');HR=HR(iu);
+end
+
+function yp=fill_gaps_limited(t,y,max_gap)
+    t=t(:);y=y(:);yp=y;
+    if numel(t)<3,return;end
+    isn=~isfinite(yp);if ~any(isn),return;end
+    d=diff([0;isn;0]);iS=find(d==1);iE=find(d==-1)-1;
+    for k=1:numel(iS)
+        a=iS(k);b=iE(k);
+        if a==1||b==numel(yp),continue;end
+        if (t(b)-t(a))<=max_gap
+            yp(a:b)=interp1([t(a-1);t(b+1)],[yp(a-1);yp(b+1)],t(a:b),'linear');
+        end
+    end
+end
+
+function out=gen_keepd_restricted(card_det)
+    out={};seen={};
+    has3=any(card_det==3);
+    if has3,try_add(3);end
+    if has3&&any(card_det==4),try_add([3 4]);end
+    if has3&&any(card_det==2),try_add([2 3]);end
+    if has3&&numel(card_det)>1,try_add(sort(card_det));end
+    if ~has3&&any(card_det==4),try_add(4);end
+    function try_add(kd)
+        kd=sort(kd);s=num2str(kd);
+        if ~any(strcmp(seen,s)),out{end+1}=kd;seen{end+1}=s;end
+    end
+end
